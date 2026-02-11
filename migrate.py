@@ -519,22 +519,27 @@ def generate_pgloader_config(mysql: MySQLConfig, pg: PGConfig):
         console.print(f"\n[red]✗ Cannot read template file:[/red] {e}")
         sys.exit(1)
 
-    # URL-encode password to handle special characters
+    # URL-encode all credential parts to handle special characters safely
+    mysql_user_encoded = quote_plus(mysql.user)
     mysql_pw_encoded = quote_plus(mysql.password)
+    mysql_db_encoded = quote_plus(mysql.database)
+
+    pg_user_encoded = quote_plus(pg.user)
     pg_pw_encoded = quote_plus(pg.password)
+    pg_db_encoded = quote_plus(pg.database)
 
     try:
         config = template.format(
-            mysql_user=mysql.user,
+            mysql_user=mysql_user_encoded,
             mysql_password=mysql_pw_encoded,
             mysql_host=mysql.docker_host,
             mysql_port=mysql.port,
-            mysql_database=mysql.database,
-            pg_user=pg.user,
+            mysql_database=mysql_db_encoded,
+            pg_user=pg_user_encoded,
             pg_password=pg_pw_encoded,
             pg_host=PG_CONTAINER_NAME if pg.host in ("localhost", "127.0.0.1") else pg.host,
             pg_port=5432 if pg.host in ("localhost", "127.0.0.1") else pg.port,
-            pg_database=pg.database,
+            pg_database=pg_db_encoded,
         )
     except KeyError as e:
         console.print(

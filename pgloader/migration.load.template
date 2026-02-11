@@ -10,9 +10,9 @@
 
 LOAD DATABASE
 
-  FROM 'mysql://{mysql_user}:{mysql_password}@{mysql_host}:{mysql_port}/{mysql_database}'
+  FROM mysql://{mysql_user}:{mysql_password}@{mysql_host}:{mysql_port}/{mysql_database}
 
-  INTO 'postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_database}'
+  INTO postgresql://{pg_user}:{pg_password}@{pg_host}:{pg_port}/{pg_database}
 
 
 -- ═══════════════════════════════════════════════════════════════
