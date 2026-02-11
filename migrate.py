@@ -28,7 +28,8 @@ import json
 import time
 import argparse
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote
+from datetime import datetime
 
 # ─── Rich imports ────────────────────────────────────────────
 from rich.console import Console
@@ -520,13 +521,14 @@ def generate_pgloader_config(mysql: MySQLConfig, pg: PGConfig):
         sys.exit(1)
 
     # URL-encode all credential parts to handle special characters safely
-    mysql_user_encoded = quote_plus(mysql.user)
-    mysql_pw_encoded = quote_plus(mysql.password)
-    mysql_db_encoded = quote_plus(mysql.database)
+    # Use quote() with safe='' to encode EVERYTHING (including / and :)
+    mysql_user_encoded = quote(mysql.user, safe="")
+    mysql_pw_encoded = quote(mysql.password, safe="")
+    mysql_db_encoded = quote(mysql.database, safe="")
 
-    pg_user_encoded = quote_plus(pg.user)
-    pg_pw_encoded = quote_plus(pg.password)
-    pg_db_encoded = quote_plus(pg.database)
+    pg_user_encoded = quote(pg.user, safe="")
+    pg_pw_encoded = quote(pg.password, safe="")
+    pg_db_encoded = quote(pg.database, safe="")
 
     try:
         config = template.format(
@@ -541,6 +543,12 @@ def generate_pgloader_config(mysql: MySQLConfig, pg: PGConfig):
             pg_port=5432 if pg.host in ("localhost", "127.0.0.1") else pg.port,
             pg_database=pg_db_encoded,
         )
+        
+        # Debug output for user verification
+        safe_mysql = f"mysql://{mysql_user_encoded}:****@{mysql.docker_host}:{mysql.port}/{mysql_db_encoded}"
+        safe_pg = f"postgresql://{pg_user_encoded}:****@{PG_CONTAINER_NAME if pg.host in ('localhost', '127.0.0.1') else pg.host}:{5432 if pg.host in ('localhost', '127.0.0.1') else pg.port}/{pg_db_encoded}"
+        console.print(f"  [dim]Generated URIs:\n    Source: {safe_mysql}\n    Target: {safe_pg}[/dim]")
+
     except KeyError as e:
         console.print(
             f"\n[red]✗ Template has an unrecognized placeholder:[/red] {e}\n"
