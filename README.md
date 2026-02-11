@@ -156,7 +156,7 @@ The tool automatically handles these MySQL → PostgreSQL type conversions:
 | MySQL Type | PostgreSQL Type | Notes |
 |---|---|---|
 | `TINYINT(1)` | `BOOLEAN` | MySQL boolean emulation |
-| `TINYINT` | `SMALLINT` | Non-boolean tiny ints |
+| `TINYINT` | `BOOLEAN` | All tinyint mapped to boolean |
 | `BIT(1)` | `BOOLEAN` | — |
 | `INT UNSIGNED` | `BIGINT` | Unsigned → wider signed |
 | `BIGINT UNSIGNED` | `NUMERIC` | No PG unsigned equivalent |
@@ -167,6 +167,10 @@ The tool automatically handles these MySQL → PostgreSQL type conversions:
 | `SET(...)` | `TEXT` | No PG equivalent |
 | `AUTO_INCREMENT` | `SERIAL` / `BIGSERIAL` | Sequences auto-created |
 
+> **Note:** pgloader 3.6.7 does not support conditional CAST predicates (`when (= precision N)`),
+> so all `TINYINT` columns are cast to `BOOLEAN`. If your schema uses `TINYINT` for non-boolean
+> values, consider a post-migration `ALTER TABLE` to fix affected columns.
+
 ---
 
 ## ✅ Validation
@@ -176,7 +180,8 @@ The tool automatically validates after migration:
 | Check | Details |
 |---|---|
 | **Row counts** | Exact comparison MySQL vs PostgreSQL per table |
-| **Boolean types** | Verifies `TINYINT(1)` → `boolean` |
+| **Schema discovery** | Auto-detects target schema (handles `public` or database-named schemas) |
+| **Boolean types** | Verifies `TINYINT` → `boolean` |
 | **Timestamp types** | Verifies `DATETIME` → `timestamptz` |
 | **Unsigned ints** | Verifies `INT UNSIGNED` → `bigint` |
 | **Primary keys** | Confirms PKs exist on all tables |
@@ -187,7 +192,7 @@ The tool automatically validates after migration:
 For manual inspection via psql:
 
 ```bash
-docker exec -it pg_target psql -U postgres -d myapp
+docker exec -it pg-target psql -U postgres -d myapp
 
 # Inside psql:
 \i scripts/validate.sql
@@ -315,6 +320,21 @@ If targeting a remote server (e.g., RDS):
 1. Ensure the remote server accepts connections from your IP.
 2. If running locally, you might need to allow your IP in the remote firewall (Security Groups).
 3. `pgloader` runs inside Docker, so it needs internet access.
+
+</details>
+
+<details>
+<summary><strong>pgloader CAST / parsing errors</strong></summary>
+
+pgloader `3.6.7~devel` has limited CAST syntax support:
+- `using <function>` is a **terminal clause** — no modifiers (`drop typemod`, `when`) can follow it.
+- `when (= precision N)` S-expression predicates are **not supported**.
+
+The template has been designed for 3.6.7 compatibility. If you upgrade pgloader, you may
+re-enable conditional CAST rules in `pgloader/migration.load.template`.
+
+pgloader logs are always saved to `pgloader/pgloader.log` (success) or
+`pgloader/pgloader_error.log` (failure) for debugging.
 
 </details>
 
