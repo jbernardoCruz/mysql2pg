@@ -12,7 +12,8 @@ Built with [pgloader](https://pgloader.io/) for data migration, [Docker](https:/
 - **Dry-run mode** — `python migrate.py --dry-run` validates config, tests connections, previews tables — without migrating
 - **Progress bar** — Live per-table progress during pgloader migration
 - **Schema diff report** — Side-by-side MySQL vs PostgreSQL type comparison after migration
-- **Automatic Docker management** — Spins up PostgreSQL and pgloader containers
+- **Automatic Docker management** — Spins up PostgreSQL and pgloader containers (if running locally)
+- **Remote PostgreSQL support** — Can migrate to external servers (RDS, DigitalOcean, etc.)
 - **Smart type casting** — Handles MySQL→PostgreSQL type differences (booleans, dates, enums, unsigned ints)
 - **Zero-date handling** — Converts MySQL's `0000-00-00` to `NULL`
 - **Built-in validation** — Row counts, column types, primary keys, foreign keys, indexes, sequences
@@ -212,6 +213,8 @@ docker exec -it pg_target psql -U postgres -d myapp
 | `postgresql.password` | `postgres` | PostgreSQL password |
 
 > ⚠️ **Security:** `migration_config.json` is in `.gitignore` — your credentials are never committed.
+>
+> **Remote PostgreSQL:** If you set `postgresql.host` to anything other than `localhost` or `127.0.0.1`, the tool will **skip starting the PostgreSQL container** and attempt to connect to your remote server directly.
 
 ---
 
@@ -301,6 +304,16 @@ newgrp docker
 The tool detects placeholder values. Make sure you've replaced:
 - `YOUR_MYSQL_PASSWORD` → your actual MySQL password
 - `YOUR_DATABASE_NAME` → your actual database name
+
+</details>
+
+<details>
+<summary><strong>Remote PostgreSQL connection failed</strong></summary>
+
+If targeting a remote server (e.g., RDS):
+1. Ensure the remote server accepts connections from your IP.
+2. If running locally, you might need to allow your IP in the remote firewall (Security Groups).
+3. `pgloader` runs inside Docker, so it needs internet access.
 
 </details>
 

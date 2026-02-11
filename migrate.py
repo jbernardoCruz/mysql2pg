@@ -1522,12 +1522,15 @@ def dry_run(mysql_cfg: MySQLConfig, pg_cfg: PGConfig):
         client.ping()
         console.print("  [green]✓[/green] Docker is running")
 
-        # Check if PG image is available
-        try:
-            client.images.get(PG_IMAGE)
-            console.print(f"  [green]✓[/green] Image [cyan]{PG_IMAGE}[/cyan] is available")
-        except NotFound:
-            console.print(f"  [yellow]⚠[/yellow] Image [cyan]{PG_IMAGE}[/cyan] will be pulled on first run")
+        # Check if PG image is available (only if we're running it)
+        if pg_cfg.host in ("localhost", "127.0.0.1"):
+            try:
+                client.images.get(PG_IMAGE)
+                console.print(f"  [green]✓[/green] Image [cyan]{PG_IMAGE}[/cyan] is available")
+            except NotFound:
+                console.print(f"  [yellow]⚠[/yellow] Image [cyan]{PG_IMAGE}[/cyan] will be pulled on first run")
+        else:
+            console.print(f"  [dim]Skipping PG image check (remote host: {pg_cfg.host})[/dim]")
 
         try:
             client.images.get(PGLOADER_IMAGE)
@@ -1718,25 +1721,30 @@ def main():
 
     console.print("")
 
-    # ── Step 2: Start PostgreSQL ──────────────────────────────
-    console.print("[bold yellow][1/6][/bold yellow] Starting PostgreSQL container...")
+    # ── Step 2: Start PostgreSQL (if local) ───────────────────
     client = get_docker_client()
-    start_postgres(client, pg_cfg)
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=console,
-    ) as progress:
-        task = progress.add_task("[cyan]Waiting for PostgreSQL to be healthy...", total=1)
-        healthy = wait_for_postgres(client)
-        progress.update(task, completed=1)
+    if pg_cfg.host in ("localhost", "127.0.0.1"):
+        console.print("[bold yellow][1/6][/bold yellow] Starting PostgreSQL container...")
+        start_postgres(client, pg_cfg)
 
-    if not healthy:
-        console.print("[red]PostgreSQL failed to start. Check Docker logs.[/red]")
-        sys.exit(1)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("[cyan]Waiting for PostgreSQL to be healthy...", total=1)
+            healthy = wait_for_postgres(client)
+            progress.update(task, completed=1)
 
-    console.print("  [green]✓[/green] PostgreSQL is ready\n")
+        if not healthy:
+            console.print("[red]PostgreSQL failed to start. Check Docker logs.[/red]")
+            sys.exit(1)
+
+        console.print("  [green]✓[/green] PostgreSQL is ready\n")
+    else:
+        console.print(f"[bold yellow][1/6][/bold yellow] Using remote PostgreSQL at [cyan]{pg_cfg.host}[/cyan]")
+        console.print("  [dim]Skipping container startup.[/dim]\n")
 
     # ── Step 3: Generate pgloader config ──────────────────────
     console.print("[bold yellow][2/6][/bold yellow] Generating pgloader configuration...")

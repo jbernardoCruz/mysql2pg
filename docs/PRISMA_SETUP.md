@@ -155,7 +155,7 @@ ERROR: P1001 Can't reach database server
 **Fix:**
 
 ```bash
-# 1. Is PostgreSQL running?
+# 1. Is PostgreSQL running? (If using local Docker container)
 docker ps | grep pg_target
 
 # 2. Check DATABASE_URL in .env
