@@ -1381,13 +1381,21 @@ def run_pgloader_with_progress(client: docker.DockerClient, mysql_cfg: MySQLConf
         )
         return False
 
-    # Get full logs for error reporting
-    if exit_code != 0:
-        try:
-            logs = container.logs().decode("utf-8", errors="replace")
-        except Exception:
-            logs = "\n".join(all_log_lines) if all_log_lines else "(could not retrieve logs)"
+    # Get full logs (always, not just on error)
+    try:
+        logs = container.logs().decode("utf-8", errors="replace")
+    except Exception:
+        logs = "\n".join(all_log_lines) if all_log_lines else "(could not retrieve logs)"
 
+    # Always save logs for debugging
+    log_file = SCRIPT_DIR / "pgloader" / ("pgloader_error.log" if exit_code != 0 else "pgloader.log")
+    try:
+        log_file.write_text(logs)
+        console.print(f"\n  [dim]Full pgloader log saved to: {log_file}[/dim]")
+    except OSError:
+        pass
+
+    if exit_code != 0:
         console.print(f"\n  [red]✗ pgloader exited with code {exit_code}[/red]")
 
         if "Access denied" in logs or "authentication" in logs.lower():
@@ -1411,14 +1419,6 @@ def run_pgloader_with_progress(client: docker.DockerClient, mysql_cfg: MySQLConf
                 "    • Check that pgloader/ directory exists\n"
             )
 
-        # Save full log to file for debugging
-        log_file = SCRIPT_DIR / "pgloader" / "pgloader_error.log"
-        try:
-            log_file.write_text(logs)
-            console.print(f"\n  [dim]Full pgloader log saved to: {log_file}[/dim]")
-        except OSError:
-            pass
-
         log_tail = logs[-4000:] if len(logs) > 4000 else logs
         if log_tail.strip():
             console.print("\n  [bold]Last pgloader output:[/bold]")
@@ -1431,9 +1431,27 @@ def run_pgloader_with_progress(client: docker.DockerClient, mysql_cfg: MySQLConf
             pass
         return False
 
+    # ── Success path ──────────────────────────────────────────
     # Show migration summary from pgloader output
     if completed_tables:
         console.print(f"\n  [green]✓[/green] {len(completed_tables)} tables processed by pgloader")
+
+    # Print pgloader's own summary (rows loaded, errors, etc.)
+    summary_lines = []
+    in_summary = False
+    for line in logs.split("\n"):
+        if "table name" in line.lower() and ("rows" in line.lower() or "read" in line.lower()):
+            in_summary = True
+        if in_summary:
+            summary_lines.append(line)
+        # Also capture key lines
+        if "error" in line.lower() and "0" not in line:
+            summary_lines.append(f"  ⚠ {line.strip()}")
+
+    if summary_lines:
+        console.print("\n  [bold]pgloader summary:[/bold]")
+        for sl in summary_lines[-30:]:
+            console.print(f"  [dim]{sl}[/dim]")
 
     try:
         container.remove(force=True)
