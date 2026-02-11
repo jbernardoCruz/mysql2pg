@@ -1609,7 +1609,7 @@ def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
         console.print(diff_table)
 
     summary_color = "green" if missing == 0 else "red"
-    console.print(f"  [{summary_color}]Schema diff:[/summary_color] {identical} identical, {conversions} conversions, {missing} missing")
+    console.print(f"  [{summary_color}]Schema diff:[/] {identical} identical, {conversions} conversions, {missing} missing")
     
     return report
 
