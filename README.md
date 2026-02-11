@@ -96,7 +96,9 @@ python migrate.py --init
     "database": "your_database"
   },
   "postgresql": {
+    "host": "localhost",
     "port": 5432,
+    "user": "postgres",
     "database": "myapp",
     "password": "postgres"
   }
@@ -203,7 +205,9 @@ docker exec -it pg_target psql -U postgres -d myapp
 | `mysql.user` | `root` | MySQL username |
 | `mysql.password` | — | MySQL password (required) |
 | `mysql.database` | — | MySQL database name (required) |
+| `postgresql.host` | `localhost` | PostgreSQL server hostname or IP |
 | `postgresql.port` | `5432` | Host port for PostgreSQL container |
+| `postgresql.user` | `postgres` | PostgreSQL username |
 | `postgresql.database` | `myapp` | PostgreSQL database name |
 | `postgresql.password` | `postgres` | PostgreSQL password |
 

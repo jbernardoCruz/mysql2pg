@@ -72,7 +72,9 @@ DEFAULT_CONFIG = {
         "database": "YOUR_DATABASE_NAME",
     },
     "postgresql": {
+        "host": "localhost",
         "port": 5432,
+        "user": "postgres",
         "database": "myapp",
         "password": "postgres",
     },
@@ -102,10 +104,10 @@ class MySQLConfig:
 
 
 class PGConfig:
-    def __init__(self, port: int, database: str, password: str):
-        self.host = "localhost"
+    def __init__(self, host: str, port: int, user: str, database: str, password: str):
+        self.host = host
         self.port = port
-        self.user = "postgres"
+        self.user = user
         self.password = password
         self.database = database
 
@@ -266,7 +268,9 @@ def load_config() -> tuple[MySQLConfig, PGConfig]:
         database=str(mysql["database"]).strip(),
     )
     pg_cfg = PGConfig(
+        host=str(pg.get("host", "localhost")).strip(),
         port=pg_port,
+        user=str(pg.get("user", "postgres")).strip(),
         database=str(pg["database"]).strip(),
         password=str(pg["password"]),
     )
@@ -515,8 +519,10 @@ def generate_pgloader_config(mysql: MySQLConfig, pg: PGConfig):
             mysql_host=mysql.docker_host,
             mysql_port=mysql.port,
             mysql_database=mysql.database,
+            pg_user=pg.user,
             pg_password=pg_pw_encoded,
-            pg_port=5432,  # Internal Docker port, always 5432
+            pg_host=PG_CONTAINER_NAME if pg.host in ("localhost", "127.0.0.1") else pg.host,
+            pg_port=5432 if pg.host in ("localhost", "127.0.0.1") else pg.port,
             pg_database=pg.database,
         )
     except KeyError as e:
