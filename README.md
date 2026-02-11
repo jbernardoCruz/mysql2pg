@@ -59,7 +59,7 @@ Built with [pgloader](https://pgloader.io/) for data migration, [Docker](https:/
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/mysql2pg.git
+git clone https://github.com/jbernardoCruz/mysql2pg.git
 cd mysql2pg
 ```
 
