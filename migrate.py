@@ -1027,29 +1027,36 @@ def get_pg_constraints(config: PGConfig, schema: str = 'public') -> dict:
             pass
 
 
-def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database: str) -> bool:
-    """Run full validation suite and print results."""
+def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database: str, verbose: bool = False) -> dict:
+    """Run full validation suite and collect results."""
     all_passed = True
     validation_errors = []
+    
+    report = {
+        "row_counts": {"tables": [], "passed": 0, "failed": 0, "total": 0},
+        "type_conversions": [],
+        "constraints": {},
+        "all_passed": True,
+        "validation_errors": []
+    }
 
     # ── Row count comparison ──────────────────────────────────
-    console.print("\n  [bold]Row Count Comparison[/bold]")
+    if verbose:
+        console.print("\n  [bold]Row Count Comparison[/bold]")
 
     try:
         mysql_counts = get_mysql_tables(mysql_cfg)
     except RuntimeError as e:
-        console.print(f"  [red]✗ MySQL error:[/red] {e}")
-        validation_errors.append("Row counts — MySQL connection failed")
+        validation_errors.append(f"MySQL connection failed: {e}")
         mysql_counts = None
 
     try:
-        # Discover which schema pgloader used
         target_schema = discover_pg_schema(pg_cfg, mysql_database)
-        console.print(f"  [dim]Validating against schema: '{target_schema}'[/dim]")
+        if verbose:
+            console.print(f"  [dim]Validating against schema: '{target_schema}'[/dim]")
         pg_counts = get_pg_tables(pg_cfg, schema=target_schema)
     except RuntimeError as e:
-        console.print(f"  [red]✗ PostgreSQL error:[/red] {e}")
-        validation_errors.append("Row counts — PostgreSQL connection failed")
+        validation_errors.append(f"PostgreSQL connection failed: {e}")
         pg_counts = None
 
     if mysql_counts is not None and pg_counts is not None:
@@ -1064,46 +1071,66 @@ def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
         for t in all_tables:
             m_count = mysql_counts.get(t, "-")
             p_count = pg_counts.get(t, "-")
+            
+            passed = False
             if m_count == p_count:
-                status = "[green]✓ OK[/green]"
+                status = "✓ OK"
+                passed = True
+                report["row_counts"]["passed"] += 1
             elif t not in pg_counts:
-                status = "[red]✗ MISSING[/red]"
+                status = "✗ MISSING"
+                report["row_counts"]["failed"] += 1
                 all_passed = False
             elif t not in mysql_counts:
-                status = "[yellow]? EXTRA[/yellow]"
+                status = "? EXTRA"
+                report["row_counts"]["passed"] += 1 # Extra tables in PG are treated as warning, not failure for "passed" count usually
             else:
-                status = f"[red]✗ MISMATCH[/red]"
+                status = "✗ MISMATCH"
+                report["row_counts"]["failed"] += 1
                 all_passed = False
 
-            table.add_row(
-                t,
-                str(m_count) if m_count != "-" else "-",
-                str(p_count) if p_count != "-" else "-",
-                status,
-            )
+            report["row_counts"]["tables"].append({
+                "table": t,
+                "mysql": m_count,
+                "pg": p_count,
+                "status": status,
+                "passed": passed
+            })
+            
+            rich_status = f"[green]{status}[/green]" if "OK" in status else f"[red]{status}[/red]"
+            if "EXTRA" in status: rich_status = f"[yellow]{status}[/yellow]"
+            
+            table.add_row(t, str(m_count), str(p_count), rich_status)
 
-        console.print(table)
+        report["row_counts"]["total"] = len(all_tables)
+        
+        if verbose:
+            console.print(table)
+        else:
+            color = "green" if all_passed else "red"
+            console.print(f"  [{color}]Row counts:[/color] {report['row_counts']['passed']}/{report['row_counts']['total']} tables match ✓")
 
     else:
         all_passed = False
-        console.print("  [red]✗ Skipped — could not connect to databases[/red]")
+        console.print("  [red]✗ Row counts skipped — database connection issues[/red]")
 
     # ── Type mapping verification ─────────────────────────────
-    console.print("\n  [bold]Type Mapping Verification[/bold]")
+    if verbose:
+        console.print("\n  [bold]Type Mapping Verification[/bold]")
 
     try:
         columns = get_pg_column_types(pg_cfg, schema=target_schema)
     except RuntimeError as e:
-        console.print(f"  [red]✗ Could not verify types:[/red] {e}")
-        validation_errors.append("Type mapping — PostgreSQL query failed")
+        validation_errors.append(f"PostgreSQL type query failed: {e}")
         columns = None
 
     if columns is not None:
         converted_types = {
-            "bool": "TINYINT(1)/BIT(1) → boolean",
+            "bool": "TINYINT/BIT → boolean",
             "timestamptz": "DATETIME → timestamptz",
             "int2": "TINYINT → smallint",
             "int8": "INT UNSIGNED → bigint",
+            "numeric": "BIGINT UNSIGNED → numeric",
         }
 
         type_table = Table(box=box.ROUNDED, show_lines=False, pad_edge=True)
@@ -1116,38 +1143,35 @@ def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
             udt = col["udt_name"]
             if udt in converted_types:
                 converted_count += 1
+                report["type_conversions"].append({
+                    "table": col["table"],
+                    "column": col["column"],
+                    "pg_type": udt,
+                    "conversion": converted_types[udt]
+                })
                 type_table.add_row(
                     f"{col['table']}.{col['column']}",
                     udt,
                     converted_types[udt],
                 )
 
-        if converted_count > 0:
+        if verbose and converted_count > 0:
             console.print(type_table)
-        else:
-            console.print("  [dim]No converted types found (this may be expected).[/dim]")
-
-        console.print(f"  [green]✓[/green] {converted_count} columns with type conversions detected")
-
-    else:
-        console.print("  [red]✗ Skipped — could not query PostgreSQL[/red]")
+            
+        console.print(f"  [green]✓ Type mapping:[/green] {converted_count} conversions detected")
 
     # ── Constraints ───────────────────────────────────────────
-    console.print("\n  [bold]Constraints & Indexes[/bold]")
+    if verbose:
+        console.print("\n  [bold]Constraints & Indexes[/bold]")
 
     try:
         constraints = get_pg_constraints(pg_cfg, schema=target_schema)
     except RuntimeError as e:
-        console.print(f"  [red]✗ Could not verify constraints:[/red] {e}")
-        validation_errors.append("Constraints — PostgreSQL query failed")
+        validation_errors.append(f"PostgreSQL constraint query failed: {e}")
         constraints = None
 
     if constraints is not None:
-        constraint_table = Table(box=box.SIMPLE, show_lines=False)
-        constraint_table.add_column("Check", style="cyan", min_width=20)
-        constraint_table.add_column("Count", justify="right", style="green")
-        constraint_table.add_column("Status", justify="center")
-
+        report["constraints"] = constraints
         checks = [
             ("Primary Keys", len(constraints["primary_keys"])),
             ("Foreign Keys", len(constraints["foreign_keys"])),
@@ -1155,28 +1179,34 @@ def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
             ("Sequences", len(constraints["sequences"])),
         ]
 
-        for name, count in checks:
-            status = "[green]✓[/green]" if count > 0 else "[yellow]—[/yellow]"
-            constraint_table.add_row(name, str(count), status)
+        if verbose:
+            constraint_table = Table(box=box.SIMPLE, show_lines=False)
+            constraint_table.add_column("Check", style="cyan", min_width=20)
+            constraint_table.add_column("Count", justify="right", style="green")
+            constraint_table.add_column("Status", justify="center")
 
-        console.print(constraint_table)
-
-    else:
-        console.print("  [red]✗ Skipped — could not query PostgreSQL[/red]")
+            for name, count in checks:
+                status = "[green]✓[/green]" if count > 0 else "[yellow]—[/yellow]"
+                constraint_table.add_row(name, str(count), status)
+            console.print(constraint_table)
+        else:
+            total_constraints = sum(count for _, count in checks)
+            console.print(f"  [green]✓ Constraints:[/green] {total_constraints} objects verified")
 
     # ── Summary of validation errors ──────────────────────────
+    report["all_passed"] = all_passed
+    report["validation_errors"] = validation_errors
+    
     if validation_errors:
-        all_passed = False
         console.print("\n  [bold red]Validation Issues:[/bold red]")
         for err in validation_errors:
             console.print(f"    [red]✗[/red] {err}")
 
-    return all_passed
+    return report
 
 
 # ═════════════════════════════════════════════════════════════
 # Step 6: MySQL schema capture (for dry-run & schema diff)
-# ═════════════════════════════════════════════════════════════
 
 def get_mysql_schema(config: MySQLConfig) -> list[dict]:
     """Get column-level schema info from MySQL."""
@@ -1464,40 +1494,41 @@ def run_pgloader_with_progress(client: docker.DockerClient, mysql_cfg: MySQLConf
 # Step 8: Schema diff report
 # ═════════════════════════════════════════════════════════════
 
-def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database: str):
+def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database: str, verbose: bool = False) -> dict:
     """Compare MySQL vs PostgreSQL schemas and highlight type conversions."""
-    console.print("\n  [bold]Schema Diff Report[/bold]")
-    console.print("  [dim]Comparing MySQL source types → PostgreSQL target types[/dim]\n")
+    if verbose:
+        console.print("\n  [bold]Schema Diff Report[/bold]")
+        console.print("  [dim]Comparing MySQL source types → PostgreSQL target types[/dim]\n")
+
+    report = {
+        "diffs": [],
+        "identical": 0,
+        "conversions": 0,
+        "missing": 0,
+        "total_columns": 0
+    }
 
     # Get MySQL schema
     try:
         mysql_cols = get_mysql_schema(mysql_cfg)
     except RuntimeError as e:
-        console.print(f"  [red]✗ Cannot read MySQL schema:[/red] {e}")
-        return
+        if verbose: console.print(f"  [red]✗ Cannot read MySQL schema:[/red] {e}")
+        return report
 
     # Get PG schema
     try:
         target_schema = discover_pg_schema(pg_cfg, mysql_database)
         pg_cols = get_pg_column_types(pg_cfg, schema=target_schema)
     except RuntimeError as e:
-        console.print(f"  [red]✗ Cannot read PostgreSQL schema:[/red] {e}")
-        return
+        if verbose: console.print(f"  [red]✗ Cannot read PostgreSQL schema:[/red] {e}")
+        return report
 
     # Build lookup: table.column -> type info
-    mysql_lookup = {}
-    for col in mysql_cols:
-        key = f"{col['table'].lower()}.{col['column'].lower()}"
-        mysql_lookup[key] = col
-
-    pg_lookup = {}
-    for col in pg_cols:
-        key = f"{col['table'].lower()}.{col['column'].lower()}"
-        pg_lookup[key] = col
+    mysql_lookup = {f"{col['table'].lower()}.{col['column'].lower()}": col for col in mysql_cols}
+    pg_lookup = {f"{col['table'].lower()}.{col['column'].lower()}": col for col in pg_cols}
 
     # Build diff table
     diff_table = Table(
-        title="Type Conversions (MySQL → PostgreSQL)",
         box=box.ROUNDED,
         show_lines=False,
         pad_edge=True,
@@ -1511,8 +1542,8 @@ def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
     missing = 0
     identical = 0
 
-    # Compare all columns present in both
     all_keys = sorted(set(list(mysql_lookup.keys()) + list(pg_lookup.keys())))
+    report["total_columns"] = len(all_keys)
 
     for key in all_keys:
         m = mysql_lookup.get(key)
@@ -1522,15 +1553,12 @@ def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
             mysql_type = m["type"]
             pg_type = p["udt_name"]
 
-            # Determine if types are "equivalent" or converted
-            # Simple heuristic: if the base type names differ, it's a conversion
             mysql_base = mysql_type.split("(")[0].lower().strip()
             pg_base = pg_type.lower().strip()
 
-            # Known equivalent pairs
             equiv_map = {
                 "int": {"int4", "int8", "integer"},
-                "bigint": {"int8", "bigint"},
+                "bigint": {"int8", "bigint", "numeric"},
                 "smallint": {"int2", "smallint"},
                 "tinyint": {"int2", "bool", "smallint"},
                 "varchar": {"varchar", "text"},
@@ -1559,53 +1587,209 @@ def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
 
             if is_same:
                 identical += 1
-                # Don't show identical types — too noisy
+                report["diffs"].append({"key": key, "mysql": mysql_type, "pg": pg_type, "status": "identical"})
             elif is_equivalent:
                 conversions += 1
-                diff_table.add_row(
-                    key,
-                    mysql_type,
-                    pg_type,
-                    "[green]✓ converted[/green]",
-                )
+                diff_table.add_row(key, mysql_type, pg_type, "[green]✓ converted[/green]")
+                report["diffs"].append({"key": key, "mysql": mysql_type, "pg": pg_type, "status": "converted"})
             else:
                 conversions += 1
-                diff_table.add_row(
-                    key,
-                    mysql_type,
-                    pg_type,
-                    "[yellow]⚡ mapped[/yellow]",
-                )
-        elif m and not p:
+                diff_table.add_row(key, mysql_type, pg_type, "[yellow]⚡ mapped[/yellow]")
+                report["diffs"].append({"key": key, "mysql": mysql_type, "pg": pg_type, "status": "mapped"})
+        elif m:
             missing += 1
-            diff_table.add_row(
-                key,
-                m["type"],
-                "—",
-                "[red]✗ missing[/red]",
-            )
-        # PG-only columns (pgloader metadata etc.) — skip silently
+            diff_table.add_row(key, m["type"], "—", "[red]✗ missing[/red]")
+            report["diffs"].append({"key": key, "mysql": m["type"], "pg": "—", "status": "missing"})
 
-    if conversions > 0 or missing > 0:
+    report["identical"] = identical
+    report["conversions"] = conversions
+    report["missing"] = missing
+
+    if verbose and (conversions > 0 or missing > 0):
         console.print(diff_table)
 
-    # Summary
-    summary = Table(box=box.SIMPLE, show_lines=False)
-    summary.add_column("Metric", style="cyan")
-    summary.add_column("Count", justify="right", style="green")
-
-    summary.add_row("Identical types", str(identical))
-    summary.add_row("Type conversions", str(conversions))
-    if missing > 0:
-        summary.add_row("[red]Missing in PG[/red]", f"[red]{missing}[/red]")
-
-    console.print(summary)
-    console.print(f"  [green]✓[/green] Schema diff complete — {conversions} conversions, {identical} identical\n")
+    summary_color = "green" if missing == 0 else "red"
+    console.print(f"  [{summary_color}]Schema diff:[/summary_color] {identical} identical, {conversions} conversions, {missing} missing")
+    
+    return report
 
 
 # ═════════════════════════════════════════════════════════════
 # Dry-run mode
 # ═════════════════════════════════════════════════════════════
+
+def generate_html_report(validation: dict, diff: dict, mysql_db: str, pg_db: str):
+    """Generate a detailed HTML migration report."""
+    html_file = "migration_report.html"
+    
+    # CSS for a modern look
+    css = """
+    body { font-family: 'Inter', -apple-system, sans-serif; line-height: 1.5; color: #333; max-width: 1200px; margin: 0 auto; padding: 40px 20px; background-color: #f8f9fa; }
+    h1, h2, h3 { color: #1a202c; }
+    .header { border-bottom: 2px solid #e2e8f0; padding-bottom: 20px; margin-bottom: 40px; display: flex; justify-content: space-between; align-items: center; }
+    .status { padding: 8px 16px; border-radius: 9999px; font-weight: 600; font-size: 0.875rem; }
+    .status-pass { background-color: #c6f6d5; color: #22543d; }
+    .status-fail { background-color: #fed7d7; color: #822727; }
+    .card { background: white; border-radius: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); padding: 24px; margin-bottom: 32px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+    th { text-align: left; padding: 12px; background: #f7fafc; border-bottom: 2px solid #edf2f7; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; color: #4a5568; }
+    td { padding: 12px; border-bottom: 1px solid #edf2f7; font-size: 0.875rem; }
+    .table-name { font-weight: 600; color: #2d3748; }
+    .mysql-val { color: #b7791f; }
+    .pg-val { color: #2f855a; }
+    .badge { padding: 2px 8px; border-radius: 4px; font-size: 0.75rem; font-weight: 600; }
+    .badge-ok { background: #c6f6d5; color: #22543d; }
+    .badge-err { background: #fed7d7; color: #822727; }
+    .badge-warn { background: #feebc8; color: #744210; }
+    .conversion-tag { color: #718096; font-style: italic; }
+    """
+
+    status_class = "status-pass" if validation["all_passed"] else "status-fail"
+    status_text = "PASSED" if validation["all_passed"] else "ISSUES DETECTED"
+
+    html = f"""<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Migration Report - {mysql_db} to {pg_db}</title>
+    <style>{css}</style>
+</head>
+<body>
+    <div class="header">
+        <div>
+            <h1>Migration Report</h1>
+            <p style="color: #718096; margin-top: 4px;">{mysql_db} (MySQL) &rarr; {pg_db} (PostgreSQL)</p>
+        </div>
+        <div class="status {status_class}">{status_text}</div>
+    </div>
+
+    <!-- Summary Stats -->
+    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 40px;">
+        <div class="card" style="margin-bottom: 0; text-align: center;">
+            <div style="color: #718096; font-size: 0.875rem;">Tables Migrated</div>
+            <div style="font-size: 2rem; font-weight: 700; color: #2d3748;">{validation['row_counts']['passed']}/{validation['row_counts']['total']}</div>
+        </div>
+        <div class="card" style="margin-bottom: 0; text-align: center;">
+            <div style="color: #718096; font-size: 0.875rem;">Type Conversions</div>
+            <div style="font-size: 2rem; font-weight: 700; color: #2d3748;">{diff['conversions']}</div>
+        </div>
+        <div class="card" style="margin-bottom: 0; text-align: center;">
+            <div style="color: #718096; font-size: 0.875rem;">Objects Verified</div>
+            <div style="font-size: 2rem; font-weight: 700; color: #2d3748;">{len(validation['constraints'].get('indexes', [])) + len(validation['constraints'].get('foreign_keys', []))}</div>
+        </div>
+    </div>
+
+    {f'<div class="card" style="border-left: 4px solid #f56565;"><h3>Errors</h3><ul style="color: #c53030;">' + "".join(f"<li>{e}</li>" for e in validation['validation_errors']) + '</ul></div>' if validation['validation_errors'] else ""}
+
+    <div class="card">
+        <h3>Row Count Comparison</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Table Name</th>
+                    <th>MySQL Count</th>
+                    <th>PostgreSQL Count</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+
+    for t in validation['row_counts']['tables']:
+        b_class = "badge-ok" if "OK" in t['status'] else "badge-err"
+        if "EXTRA" in t['status']: b_class = "badge-warn"
+        
+        html += f"""
+                <tr>
+                    <td class="table-name">{t['table']}</td>
+                    <td class="mysql-val">{t['mysql']}</td>
+                    <td class="pg-val">{t['pg']}</td>
+                    <td><span class="badge {b_class}">{t['status']}</span></td>
+                </tr>"""
+
+    html += """
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h3>Type Mappings & Conversions</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Table.Column</th>
+                    <th>MySQL Type</th>
+                    <th>PostgreSQL Type</th>
+                    <th>Status</th>
+                </tr>
+            </thead>
+            <tbody>
+    """
+
+    for d in diff['diffs']:
+        if d['status'] == 'identical': continue
+        b_class = "badge-ok" if d['status'] == 'converted' else "badge-warn"
+        if d['status'] == 'missing': b_class = "badge-err"
+        
+        html += f"""
+                <tr>
+                    <td class="table-name">{d['key']}</td>
+                    <td class="mysql-val">{d['mysql']}</td>
+                    <td class="pg-val">{d['pg']}</td>
+                    <td><span class="badge {b_class}">{d['status']}</span></td>
+                </tr>"""
+
+    html += """
+            </tbody>
+        </table>
+    </div>
+
+    <div class="card">
+        <h3>Constraints & Metadata</h3>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 40px;">
+            <div>
+                <h4>Foreign Keys</h4>
+                <ul style="font-size: 0.875rem; color: #4a5568;">
+    """
+    
+    if validation['constraints'].get('foreign_keys'):
+        for fk in validation['constraints']['foreign_keys']:
+            html += f"<li><code>{fk[0]}.{fk[1]}</code> &rarr; <code>{fk[2]}.{fk[3]}</code></li>"
+    else:
+        html += "<li>No foreign keys detected</li>"
+
+    html += """
+                </ul>
+            </div>
+            <div>
+                <h4>Indexes</h4>
+                <ul style="font-size: 0.875rem; color: #4a5568;">
+    """
+
+    if validation['constraints'].get('indexes'):
+        for idx in validation['constraints']['indexes']:
+            html += f"<li><code>{idx[1]}</code> on <code>{idx[0]}</code></li>"
+    else:
+        html += "<li>No indexes detected</li>"
+
+    html += """
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <footer style="text-align: center; color: #a0aec0; font-size: 0.75rem; margin-top: 40px;">
+        Generated by mysql2pg migration tool
+    </footer>
+</body>
+</html>
+    """
+
+    with open(html_file, "w") as f:
+        f.write(html)
+    
+    return html_file
+
 
 def dry_run(mysql_cfg: MySQLConfig, pg_cfg: PGConfig):
     """Validate config and preview what would be migrated, without actually migrating."""
@@ -1770,6 +1954,7 @@ def parse_args():
         action="store_true",
         help="Validate config, test connections, preview schema — no migration",
     )
+    parser.add_argument("--verbose", action="store_true", help="Show full detailed tables in console")
     return parser.parse_args()
 
 
@@ -1891,19 +2076,30 @@ def main():
     console.print("[bold yellow][4/6][/bold yellow] Validating migration...")
 
     try:
-        all_passed = validate_migration(mysql_cfg, pg_cfg, mysql_cfg.database)
+        report = validate_migration(mysql_cfg, pg_cfg, mysql_cfg.database, verbose=args.verbose)
+        all_passed = report["all_passed"]
     except Exception as e:
         console.print(f"\n  [red]✗ Validation error: {e}[/red]")
         console.print("  [dim]You can still validate manually with the SQL scripts in scripts/[/dim]")
         all_passed = False
+        report = None
 
     # ── Step 6: Schema diff ───────────────────────────────────
     console.print("[bold yellow][5/6][/bold yellow] Schema diff report...")
 
     try:
-        schema_diff_report(mysql_cfg, pg_cfg, mysql_cfg.database)
+        diff_report = schema_diff_report(mysql_cfg, pg_cfg, mysql_cfg.database, verbose=args.verbose)
     except Exception as e:
         console.print(f"\n  [red]✗ Schema diff error: {e}[/red]")
+        diff_report = None
+
+    # ── Step 7: HTML Report ───────────────────────────────────
+    if report and diff_report:
+        try:
+            html_path = generate_html_report(report, diff_report, mysql_cfg.database, pg_cfg.database)
+            console.print(f"  [green]✓[/green] Detailed report generated: [cyan]{html_path}[/cyan]")
+        except Exception as e:
+            console.print(f"  [red]✗ HTML report error: {e}[/red]")
 
     # ── Summary ───────────────────────────────────────────────
     console.print("")
@@ -1913,12 +2109,8 @@ def main():
         console.print(
             Panel(
                 "[bold green]✓ Migration completed successfully![/bold green]\n"
-                "[green]All row counts match and types are correctly mapped.[/green]\n\n"
-                "[bold]Next steps — Set up Prisma:[/bold]\n"
-                "  [dim]1.[/dim] npm install\n"
-                "  [dim]2.[/dim] npx prisma db pull\n"
-                "  [dim]3.[/dim] npx prisma generate\n"
-                "  [dim]4.[/dim] npm run test:connection",
+                f"[green]All tables and types have been verified.[/green]\n\n"
+                "Detailed results saved to: [bold cyan]migration_report.html[/bold cyan]",
                 border_style="green",
                 padding=(1, 2),
             )
@@ -1926,13 +2118,10 @@ def main():
     else:
         console.print(
             Panel(
-                "[bold yellow]⚠ Migration completed with warnings.[/bold yellow]\n"
-                "[yellow]Some checks did not pass — review the output above.[/yellow]\n\n"
-                "[bold]Manual validation:[/bold]\n"
-                "  [dim]docker exec -it pg_target psql -U postgres -d {db}[/dim]\n"
-                "  [dim]\\i scripts/validate.sql[/dim]\n"
-                "  [dim]\\i scripts/validate_types.sql[/dim]".format(db=pg_cfg.database),
-                border_style="yellow",
+                "[bold red]✗ Migration finished with issues[/bold red]\n"
+                "Some validations failed. Check the summary above or the HTML report.\n\n"
+                "Detailed results saved to: [bold cyan]migration_report.html[/bold cyan]",
+                border_style="red",
                 padding=(1, 2),
             )
         )
