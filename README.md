@@ -20,6 +20,7 @@ Built with [pgloader](https://pgloader.io/) for data migration, [Docker](https:/
 - **Rich terminal UI** — Colored output, progress bars, formatted tables
 - **File-based config** — No interactive prompts; fill in a JSON file and run
 - **Prisma-ready** — Optional post-migration Prisma ORM setup
+- **Safe & Read-Only** — Never modifies or deletes data from the source MySQL database
 
 ---
 
