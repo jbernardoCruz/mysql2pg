@@ -9,11 +9,14 @@ Built with [pgloader](https://pgloader.io/) for data migration, [Docker](https:/
 ## ✨ Features
 
 - **One-command migration** — `python migrate.py` handles everything
+- **Dry-run mode** — `python migrate.py --dry-run` validates config, tests connections, previews tables — without migrating
+- **Progress bar** — Live per-table progress during pgloader migration
+- **Schema diff report** — Side-by-side MySQL vs PostgreSQL type comparison after migration
 - **Automatic Docker management** — Spins up PostgreSQL and pgloader containers
 - **Smart type casting** — Handles MySQL→PostgreSQL type differences (booleans, dates, enums, unsigned ints)
 - **Zero-date handling** — Converts MySQL's `0000-00-00` to `NULL`
 - **Built-in validation** — Row counts, column types, primary keys, foreign keys, indexes, sequences
-- **Rich terminal UI** — Colored output, progress spinners, formatted tables
+- **Rich terminal UI** — Colored output, progress bars, formatted tables
 - **File-based config** — No interactive prompts; fill in a JSON file and run
 - **Prisma-ready** — Optional post-migration Prisma ORM setup
 
@@ -27,13 +30,16 @@ Built with [pgloader](https://pgloader.io/) for data migration, [Docker](https:/
 │   Ubuntu/Linux • Powered by pgloader + Docker        │
 ╰──────────────────────────────────────────────────────╯
 
-  Loading config from migration_config.json...
-  ✓ Config loaded
+  ✓ Config loaded from migration_config.json
 
-[1/5] Starting PostgreSQL container...         ✓
-[2/5] Generating pgloader configuration...     ✓
-[3/5] Running pgloader migration...            ✓
-[4/5] Validating migration...
+[1/6] Starting PostgreSQL container...         ✓
+[2/6] Generating pgloader configuration...     ✓
+[3/6] Running pgloader migration...
+
+  ⠋ Migrating 8 tables (104,783 rows)...  ████████████▌     50%  0:00:12
+  ⠋ Migrated orders (5/8)...
+
+[4/6] Validating migration...
 
   Row Count Comparison
   ╭──────────────┬─────────┬──────────┬────────╮
@@ -44,7 +50,8 @@ Built with [pgloader](https://pgloader.io/) for data migration, [Docker](https:/
   │ products     │ 3,102   │ 3,102    │ ✓ OK   │
   ╰──────────────┴─────────┴──────────┴────────╯
 
-[5/5] Migration summary
+[5/6] Schema diff report...
+[6/6] Migration summary
 
 ╭──────────────────────────────────────────────────────╮
 │  ✓ Migration completed successfully!                 │
@@ -96,13 +103,21 @@ python migrate.py --init
 }
 ```
 
-### 5. Run the migration
+### 5. Preview with dry-run (optional)
+
+```bash
+python migrate.py --dry-run
+```
+
+This validates your config, tests the MySQL connection, checks Docker, and shows what will be migrated — **without touching any data**.
+
+### 6. Run the migration
 
 ```bash
 python migrate.py
 ```
 
-That's it. The tool will start PostgreSQL in Docker, run pgloader, migrate your data, and validate the results.
+That's it. The tool will start PostgreSQL in Docker, run pgloader with a progress bar, migrate your data, validate the results, and show a schema diff report.
 
 ---
 
@@ -306,8 +321,8 @@ Contributions are welcome! Here's how:
 ### Ideas for contributions:
 
 - [ ] Support for custom type casting rules via config
-- [ ] Dry-run mode (validate config without migrating)
+- [x] ~~Dry-run mode (validate config without migrating)~~ — ✅ Implemented
 - [ ] Support for table filtering (include/exclude specific tables)
-- [ ] Progress bar during pgloader migration (parse log output)
+- [x] ~~Progress bar during pgloader migration (parse log output)~~ — ✅ Implemented
 - [ ] macOS / Windows support
-- [ ] Schema diff report (before/after comparison)
+- [x] ~~Schema diff report (before/after comparison)~~ — ✅ Implemented

@@ -22,9 +22,11 @@
 """
 
 import os
+import re
 import sys
 import json
 import time
+import argparse
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -33,7 +35,10 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.prompt import Confirm
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import (
+    Progress, SpinnerColumn, TextColumn,
+    BarColumn, TaskProgressColumn, TimeElapsedColumn,
+)
 from rich import box
 
 # ─── Docker SDK ──────────────────────────────────────────────
@@ -1066,12 +1071,579 @@ def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig) -> bool:
 
 
 # ═════════════════════════════════════════════════════════════
+# Step 6: MySQL schema capture (for dry-run & schema diff)
+# ═════════════════════════════════════════════════════════════
+
+def get_mysql_schema(config: MySQLConfig) -> list[dict]:
+    """Get column-level schema info from MySQL."""
+    try:
+        conn = mysql.connector.connect(
+            host=config.host,
+            port=config.port,
+            user=config.user,
+            password=config.password,
+            database=config.database,
+            connect_timeout=10,
+        )
+    except MySQLError as e:
+        raise RuntimeError(
+            f"Cannot connect to MySQL for schema capture: {e}"
+        )
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT table_name, column_name, column_type, is_nullable, column_default, column_key
+            FROM information_schema.columns
+            WHERE table_schema = %s
+            ORDER BY table_name, ordinal_position
+        """, (config.database,))
+        columns = []
+        for row in cursor.fetchall():
+            columns.append({
+                "table": row[0],
+                "column": row[1],
+                "type": row[2],
+                "nullable": row[3],
+                "default": row[4],
+                "key": row[5],
+            })
+        return columns
+    except MySQLError as e:
+        raise RuntimeError(
+            f"MySQL schema query failed: {e}"
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ═════════════════════════════════════════════════════════════
+# Step 7: pgloader with progress bar
+# ═════════════════════════════════════════════════════════════
+
+def run_pgloader_with_progress(client: docker.DockerClient, mysql_cfg: MySQLConfig) -> bool:
+    """Run pgloader with a Rich progress bar instead of raw log output."""
+
+    # Get expected tables from MySQL for progress tracking
+    try:
+        mysql_counts = get_mysql_tables(mysql_cfg)
+        expected_tables = list(mysql_counts.keys())
+        total_rows = sum(mysql_counts.values())
+    except Exception:
+        # Fall back to basic mode if we can't get table info
+        console.print("  [dim]Could not pre-fetch table list — using basic progress.[/dim]")
+        expected_tables = []
+        total_rows = 0
+
+    # Pull image if needed
+    try:
+        client.images.get(PGLOADER_IMAGE)
+    except NotFound:
+        console.print(f"  Pulling [cyan]{PGLOADER_IMAGE}[/cyan]...")
+        try:
+            client.images.pull(PGLOADER_IMAGE)
+        except APIError as e:
+            console.print(
+                f"\n[red]✗ Failed to pull Docker image {PGLOADER_IMAGE}:[/red] {e}\n"
+                "  [yellow]Troubleshooting:[/yellow]\n"
+                "    1. Check internet connection\n"
+                "    2. Try manually: [dim]docker pull " + PGLOADER_IMAGE + "[/dim]\n"
+            )
+            sys.exit(1)
+
+    # Ensure network exists
+    ensure_network(client, DOCKER_NETWORK)
+
+    # Remove previous pgloader container if exists
+    try:
+        old = client.containers.get("pgloader_runner")
+        old.remove(force=True)
+    except NotFound:
+        pass
+    except APIError as e:
+        console.print(
+            f"\n[yellow]⚠ Could not remove old pgloader container:[/yellow] {e}\n"
+            "  [dim]Trying to continue anyway...[/dim]\n"
+        )
+
+    # Build extra_hosts for Linux host networking
+    extra_hosts = {}
+    if mysql_cfg.docker_host == "host.docker.internal":
+        extra_hosts["host.docker.internal"] = "host-gateway"
+
+    # Run pgloader
+    pgloader_dir = str(SCRIPT_DIR / "pgloader")
+    try:
+        container = client.containers.run(
+            PGLOADER_IMAGE,
+            command="pgloader /pgloader/migration.load",
+            name="pgloader_runner",
+            detach=True,
+            volumes={pgloader_dir: {"bind": "/pgloader", "mode": "ro"}},
+            network=DOCKER_NETWORK,
+            extra_hosts=extra_hosts,
+            remove=False,
+        )
+    except APIError as e:
+        error_msg = str(e)
+        if "Conflict" in error_msg:
+            console.print(
+                "\n[red]✗ pgloader container name conflict.[/red]\n"
+                "  [dim]Try: docker rm -f pgloader_runner[/dim]\n"
+            )
+        else:
+            console.print(
+                f"\n[red]✗ Failed to start pgloader container:[/red] {e}\n"
+                "  [dim]Check Docker daemon status: docker info[/dim]\n"
+            )
+        return False
+
+    # Stream logs with progress bar
+    console.print("")
+    completed_tables = set()
+    migrated_rows = 0
+    all_log_lines = []
+
+    # Regex to match pgloader summary lines like:
+    #   table_name           1234          0
+    table_line_re = re.compile(
+        r"^\s*[\w.]+\.(\w+)\s+\.\.\.\.\.\.\s+(\d+)\s+(\d+)\s+(\d+)\s",
+    )
+    # Alternative simpler pattern for rows
+    simple_row_re = re.compile(
+        r"^\s+(\w+)\s+(\d+)\s+(\d+)\s*$"
+    )
+
+    try:
+        if expected_tables:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(bar_width=30),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                main_task = progress.add_task(
+                    f"[cyan]Migrating {len(expected_tables)} tables ({total_rows:,} rows)...",
+                    total=len(expected_tables),
+                )
+
+                for line in container.logs(stream=True, follow=True):
+                    text = line.decode("utf-8", errors="replace").rstrip()
+                    if not text:
+                        continue
+                    all_log_lines.append(text)
+
+                    # Try to detect completed table from pgloader output
+                    text_lower = text.lower().strip()
+                    for tbl in expected_tables:
+                        if tbl not in completed_tables and tbl.lower() in text_lower:
+                            # Check if it looks like a completion line (has numbers)
+                            if re.search(r'\d+\s+\d+', text):
+                                completed_tables.add(tbl)
+                                progress.update(main_task, completed=len(completed_tables))
+                                progress.update(
+                                    main_task,
+                                    description=f"[cyan]Migrated [green]{tbl}[/green] ({len(completed_tables)}/{len(expected_tables)})...",
+                                )
+                                break
+
+                # Ensure bar completes
+                progress.update(main_task, completed=len(expected_tables))
+        else:
+            # Fallback: basic spinner if no table info
+            for line in container.logs(stream=True, follow=True):
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    all_log_lines.append(text)
+                    console.print(f"  [dim]{text}[/dim]")
+
+    except Exception as e:
+        console.print(f"\n  [yellow]⚠ Log streaming interrupted:[/yellow] {e}")
+
+    # Wait for container to finish
+    try:
+        result = container.wait(timeout=600)
+        exit_code = result.get("StatusCode", -1)
+    except Exception as e:
+        console.print(
+            f"\n[red]✗ pgloader container timed out or failed:[/red] {e}\n"
+            "  [dim]Check container status: docker ps -a | grep pgloader[/dim]\n"
+            "  [dim]View logs: docker logs pgloader_runner[/dim]\n"
+        )
+        return False
+
+    # Get full logs for error reporting
+    if exit_code != 0:
+        try:
+            logs = container.logs().decode("utf-8", errors="replace")
+        except Exception:
+            logs = "\n".join(all_log_lines) if all_log_lines else "(could not retrieve logs)"
+
+        console.print(f"\n  [red]✗ pgloader exited with code {exit_code}[/red]")
+
+        if "Access denied" in logs or "authentication" in logs.lower():
+            console.print(
+                "\n  [yellow]Likely cause:[/yellow] MySQL authentication failed inside Docker.\n"
+                "    • Check credentials in [cyan]migration_config.json[/cyan]\n"
+                "    • Ensure MySQL user can connect from Docker network\n"
+                "    • Grant access: [dim]GRANT ALL ON db.* TO 'user'@'%';[/dim]\n"
+            )
+        elif "could not connect" in logs.lower() or "connection refused" in logs.lower():
+            console.print(
+                "\n  [yellow]Likely cause:[/yellow] pgloader cannot reach MySQL from inside Docker.\n"
+                "    • Firewall: [dim]sudo ufw allow from 172.16.0.0/12 to any port 3306[/dim]\n"
+                "    • MySQL bind-address: set [dim]bind-address = 0.0.0.0[/dim]\n"
+                "    • Restart MySQL: [dim]sudo systemctl restart mysql[/dim]\n"
+            )
+        elif "No such file" in logs:
+            console.print(
+                "\n  [yellow]Likely cause:[/yellow] pgloader config file not mounted correctly.\n"
+                f"    • Expected at: {PGLOADER_OUTPUT}\n"
+                "    • Check that pgloader/ directory exists\n"
+            )
+
+        log_tail = logs[-2000:] if len(logs) > 2000 else logs
+        if log_tail.strip():
+            console.print("\n  [bold]Last pgloader output:[/bold]")
+            for log_line in log_tail.strip().split("\n")[-20:]:
+                console.print(f"  [dim]{log_line}[/dim]")
+
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
+        return False
+
+    # Show migration summary from pgloader output
+    if completed_tables:
+        console.print(f"\n  [green]✓[/green] {len(completed_tables)} tables processed by pgloader")
+
+    try:
+        container.remove(force=True)
+    except Exception:
+        pass
+    return True
+
+
+# ═════════════════════════════════════════════════════════════
+# Step 8: Schema diff report
+# ═════════════════════════════════════════════════════════════
+
+def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig):
+    """Compare MySQL vs PostgreSQL schemas and highlight type conversions."""
+    console.print("\n  [bold]Schema Diff Report[/bold]")
+    console.print("  [dim]Comparing MySQL source types → PostgreSQL target types[/dim]\n")
+
+    # Get MySQL schema
+    try:
+        mysql_cols = get_mysql_schema(mysql_cfg)
+    except RuntimeError as e:
+        console.print(f"  [red]✗ Cannot read MySQL schema:[/red] {e}")
+        return
+
+    # Get PG schema
+    try:
+        pg_cols = get_pg_column_types(pg_cfg)
+    except RuntimeError as e:
+        console.print(f"  [red]✗ Cannot read PostgreSQL schema:[/red] {e}")
+        return
+
+    # Build lookup: table.column -> type info
+    mysql_lookup = {}
+    for col in mysql_cols:
+        key = f"{col['table'].lower()}.{col['column'].lower()}"
+        mysql_lookup[key] = col
+
+    pg_lookup = {}
+    for col in pg_cols:
+        key = f"{col['table'].lower()}.{col['column'].lower()}"
+        pg_lookup[key] = col
+
+    # Build diff table
+    diff_table = Table(
+        title="Type Conversions (MySQL → PostgreSQL)",
+        box=box.ROUNDED,
+        show_lines=False,
+        pad_edge=True,
+    )
+    diff_table.add_column("Table.Column", style="cyan", min_width=25)
+    diff_table.add_column("MySQL Type", style="yellow")
+    diff_table.add_column("PG Type", style="green")
+    diff_table.add_column("Status", justify="center")
+
+    conversions = 0
+    missing = 0
+    identical = 0
+
+    # Compare all columns present in both
+    all_keys = sorted(set(list(mysql_lookup.keys()) + list(pg_lookup.keys())))
+
+    for key in all_keys:
+        m = mysql_lookup.get(key)
+        p = pg_lookup.get(key)
+
+        if m and p:
+            mysql_type = m["type"]
+            pg_type = p["udt_name"]
+
+            # Determine if types are "equivalent" or converted
+            # Simple heuristic: if the base type names differ, it's a conversion
+            mysql_base = mysql_type.split("(")[0].lower().strip()
+            pg_base = pg_type.lower().strip()
+
+            # Known equivalent pairs
+            equiv_map = {
+                "int": {"int4", "int8", "integer"},
+                "bigint": {"int8", "bigint"},
+                "smallint": {"int2", "smallint"},
+                "tinyint": {"int2", "bool", "smallint"},
+                "varchar": {"varchar", "text"},
+                "char": {"bpchar", "char"},
+                "text": {"text"},
+                "longtext": {"text"},
+                "mediumtext": {"text"},
+                "datetime": {"timestamp", "timestamptz"},
+                "timestamp": {"timestamp", "timestamptz"},
+                "date": {"date"},
+                "time": {"time", "timetz"},
+                "decimal": {"numeric"},
+                "float": {"float4", "float8", "real"},
+                "double": {"float8", "double precision"},
+                "blob": {"bytea"},
+                "longblob": {"bytea"},
+                "mediumblob": {"bytea"},
+                "bit": {"bool", "bit"},
+                "enum": {"text", "varchar"},
+                "json": {"json", "jsonb"},
+                "boolean": {"bool"},
+            }
+
+            is_equivalent = pg_base in equiv_map.get(mysql_base, set())
+            is_same = mysql_base == pg_base
+
+            if is_same:
+                identical += 1
+                # Don't show identical types — too noisy
+            elif is_equivalent:
+                conversions += 1
+                diff_table.add_row(
+                    key,
+                    mysql_type,
+                    pg_type,
+                    "[green]✓ converted[/green]",
+                )
+            else:
+                conversions += 1
+                diff_table.add_row(
+                    key,
+                    mysql_type,
+                    pg_type,
+                    "[yellow]⚡ mapped[/yellow]",
+                )
+        elif m and not p:
+            missing += 1
+            diff_table.add_row(
+                key,
+                m["type"],
+                "—",
+                "[red]✗ missing[/red]",
+            )
+        # PG-only columns (pgloader metadata etc.) — skip silently
+
+    if conversions > 0 or missing > 0:
+        console.print(diff_table)
+
+    # Summary
+    summary = Table(box=box.SIMPLE, show_lines=False)
+    summary.add_column("Metric", style="cyan")
+    summary.add_column("Count", justify="right", style="green")
+
+    summary.add_row("Identical types", str(identical))
+    summary.add_row("Type conversions", str(conversions))
+    if missing > 0:
+        summary.add_row("[red]Missing in PG[/red]", f"[red]{missing}[/red]")
+
+    console.print(summary)
+    console.print(f"  [green]✓[/green] Schema diff complete — {conversions} conversions, {identical} identical\n")
+
+
+# ═════════════════════════════════════════════════════════════
+# Dry-run mode
+# ═════════════════════════════════════════════════════════════
+
+def dry_run(mysql_cfg: MySQLConfig, pg_cfg: PGConfig):
+    """Validate config and preview what would be migrated, without actually migrating."""
+    console.print(
+        Panel(
+            "[bold white]MySQL → PostgreSQL Migration Tool[/bold white]\n"
+            "[dim]🔍 DRY RUN — No data will be migrated[/dim]",
+            border_style="bright_magenta",
+            padding=(1, 4),
+        )
+    )
+
+    all_ok = True
+
+    # ── 1. Config ─────────────────────────────────────────────
+    console.print("[bold yellow][1/4][/bold yellow] Configuration")
+    console.print(
+        Panel(
+            f"[bold]Source:[/bold]  mysql://{mysql_cfg.user}:****@{mysql_cfg.host}:{mysql_cfg.port}/{mysql_cfg.database}\n"
+            f"[bold]Target:[/bold]  postgresql://{pg_cfg.user}:****@localhost:{pg_cfg.port}/{pg_cfg.database}",
+            border_style="dim",
+        )
+    )
+    console.print("  [green]✓[/green] Config is valid\n")
+
+    # ── 2. MySQL connection ───────────────────────────────────
+    console.print("[bold yellow][2/4][/bold yellow] MySQL connection")
+    connected = test_mysql_connection(mysql_cfg)
+    if not connected:
+        console.print("  [red]✗ MySQL is not reachable.[/red]")
+        all_ok = False
+    else:
+        console.print("  [green]✓[/green] MySQL is reachable\n")
+
+    # ── 3. Docker ─────────────────────────────────────────────
+    console.print("[bold yellow][3/4][/bold yellow] Docker availability")
+    try:
+        client = docker.from_env()
+        client.ping()
+        console.print("  [green]✓[/green] Docker is running")
+
+        # Check if PG image is available
+        try:
+            client.images.get(PG_IMAGE)
+            console.print(f"  [green]✓[/green] Image [cyan]{PG_IMAGE}[/cyan] is available")
+        except NotFound:
+            console.print(f"  [yellow]⚠[/yellow] Image [cyan]{PG_IMAGE}[/cyan] will be pulled on first run")
+
+        try:
+            client.images.get(PGLOADER_IMAGE)
+            console.print(f"  [green]✓[/green] Image [cyan]{PGLOADER_IMAGE}[/cyan] is available")
+        except NotFound:
+            console.print(f"  [yellow]⚠[/yellow] Image [cyan]{PGLOADER_IMAGE}[/cyan] will be pulled on first run")
+
+        console.print("")
+    except DockerException:
+        console.print("  [red]✗ Docker is not running.[/red]")
+        console.print("  [dim]Start it: sudo systemctl start docker[/dim]\n")
+        all_ok = False
+
+    # ── 4. Schema preview ─────────────────────────────────────
+    console.print("[bold yellow][4/4][/bold yellow] Source database preview")
+    if connected:
+        try:
+            mysql_counts = get_mysql_tables(mysql_cfg)
+            mysql_schema = get_mysql_schema(mysql_cfg)
+
+            if not mysql_counts:
+                console.print("  [yellow]⚠ No tables found in the MySQL database.[/yellow]\n")
+            else:
+                # Tables and row counts
+                preview_table = Table(box=box.ROUNDED, show_lines=False, pad_edge=True)
+                preview_table.add_column("Table", style="cyan", min_width=20)
+                preview_table.add_column("Rows", justify="right", style="yellow")
+                preview_table.add_column("Columns", justify="right", style="green")
+
+                # Count columns per table
+                cols_per_table = {}
+                for col in mysql_schema:
+                    tbl = col["table"].lower()
+                    cols_per_table[tbl] = cols_per_table.get(tbl, 0) + 1
+
+                total_rows = 0
+                total_cols = 0
+                for tbl in sorted(mysql_counts.keys()):
+                    row_count = mysql_counts[tbl]
+                    col_count = cols_per_table.get(tbl, 0)
+                    total_rows += row_count if row_count >= 0 else 0
+                    total_cols += col_count
+                    preview_table.add_row(tbl, f"{row_count:,}", str(col_count))
+
+                # Footer
+                preview_table.add_section()
+                preview_table.add_row(
+                    f"[bold]{len(mysql_counts)} tables[/bold]",
+                    f"[bold]{total_rows:,}[/bold]",
+                    f"[bold]{total_cols}[/bold]",
+                )
+
+                console.print(preview_table)
+                console.print(
+                    f"\n  [green]✓[/green] {len(mysql_counts)} tables with "
+                    f"{total_rows:,} total rows ready to migrate\n"
+                )
+
+        except RuntimeError as e:
+            console.print(f"  [red]✗ Could not preview schema:[/red] {e}")
+            all_ok = False
+    else:
+        console.print("  [dim]Skipped — MySQL connection failed.[/dim]\n")
+
+    # ── Summary ───────────────────────────────────────────────
+    if all_ok:
+        console.print(
+            Panel(
+                "[bold green]✓ Dry run passed — everything looks good![/bold green]\n\n"
+                "[bold]Ready to migrate. Run:[/bold]\n"
+                "  [cyan]python migrate.py[/cyan]",
+                border_style="green",
+                padding=(1, 2),
+            )
+        )
+    else:
+        console.print(
+            Panel(
+                "[bold red]✗ Dry run found issues.[/bold red]\n"
+                "[yellow]Fix the errors above before running the actual migration.[/yellow]",
+                border_style="red",
+                padding=(1, 2),
+            )
+        )
+
+    return 0 if all_ok else 1
+
+
+# ═════════════════════════════════════════════════════════════
 # Main pipeline
 # ═════════════════════════════════════════════════════════════
 
+def parse_args():
+    """Parse CLI arguments."""
+    parser = argparse.ArgumentParser(
+        description="MySQL → PostgreSQL Migration Tool",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python migrate.py --init       Create config file template\n"
+            "  python migrate.py --dry-run    Validate without migrating\n"
+            "  python migrate.py              Run full migration\n"
+        ),
+    )
+    parser.add_argument(
+        "--init",
+        action="store_true",
+        help="Create migration_config.json template and exit",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate config, test connections, preview schema — no migration",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     # ── Handle --init flag ────────────────────────────────────
-    if "--init" in sys.argv:
+    if args.init:
         console.print(
             Panel(
                 "[bold white]MySQL → PostgreSQL Migration Tool[/bold white]\n"
@@ -1082,6 +1654,13 @@ def main():
         )
         init_config()
         return 0
+
+    # ── Load config (needed for both dry-run and full migration) ──
+    mysql_cfg, pg_cfg = load_config()
+
+    # ── Handle --dry-run flag ─────────────────────────────────
+    if args.dry_run:
+        return dry_run(mysql_cfg, pg_cfg)
 
     # ── Banner ────────────────────────────────────────────────
     console.print(
@@ -1094,9 +1673,7 @@ def main():
     )
 
     # ── Step 1: Load config file ─────────────────────────────
-    console.print(f"  Loading config from [cyan]{CONFIG_FILE.name}[/cyan]...")
-    mysql_cfg, pg_cfg = load_config()
-    console.print("  [green]✓[/green] Config loaded\n")
+    console.print(f"  [green]✓[/green] Config loaded from [cyan]{CONFIG_FILE.name}[/cyan]\n")
 
     # ── Test MySQL connection ─────────────────────────────────
     console.print("")
@@ -1136,7 +1713,7 @@ def main():
     console.print("")
 
     # ── Step 2: Start PostgreSQL ──────────────────────────────
-    console.print("[bold yellow][1/5][/bold yellow] Starting PostgreSQL container...")
+    console.print("[bold yellow][1/6][/bold yellow] Starting PostgreSQL container...")
     client = get_docker_client()
     start_postgres(client, pg_cfg)
 
@@ -1156,15 +1733,15 @@ def main():
     console.print("  [green]✓[/green] PostgreSQL is ready\n")
 
     # ── Step 3: Generate pgloader config ──────────────────────
-    console.print("[bold yellow][2/5][/bold yellow] Generating pgloader configuration...")
+    console.print("[bold yellow][2/6][/bold yellow] Generating pgloader configuration...")
     generate_pgloader_config(mysql_cfg, pg_cfg)
     console.print(f"  [green]✓[/green] Config written to [dim]{PGLOADER_OUTPUT}[/dim]\n")
 
     # ── Step 4: Run pgloader ──────────────────────────────────
-    console.print("[bold yellow][3/5][/bold yellow] Running pgloader migration...")
+    console.print("[bold yellow][3/6][/bold yellow] Running pgloader migration...")
     console.print("  [dim]This may take a while depending on database size.[/dim]\n")
 
-    success = run_pgloader(client, mysql_cfg)
+    success = run_pgloader_with_progress(client, mysql_cfg)
     if not success:
         console.print("\n[red]Migration failed. Check the pgloader output above.[/red]")
         sys.exit(1)
@@ -1172,7 +1749,7 @@ def main():
     console.print("\n  [green]✓[/green] pgloader migration complete\n")
 
     # ── Step 5: Validate ──────────────────────────────────────
-    console.print("[bold yellow][4/5][/bold yellow] Validating migration...")
+    console.print("[bold yellow][4/6][/bold yellow] Validating migration...")
 
     try:
         all_passed = validate_migration(mysql_cfg, pg_cfg)
@@ -1181,9 +1758,17 @@ def main():
         console.print("  [dim]You can still validate manually with the SQL scripts in scripts/[/dim]")
         all_passed = False
 
+    # ── Step 6: Schema diff ───────────────────────────────────
+    console.print("[bold yellow][5/6][/bold yellow] Schema diff report...")
+
+    try:
+        schema_diff_report(mysql_cfg, pg_cfg)
+    except Exception as e:
+        console.print(f"\n  [red]✗ Schema diff error: {e}[/red]")
+
     # ── Summary ───────────────────────────────────────────────
     console.print("")
-    console.print("[bold yellow][5/5][/bold yellow] Migration summary")
+    console.print("[bold yellow][6/6][/bold yellow] Migration summary")
 
     if all_passed:
         console.print(
@@ -1229,3 +1814,4 @@ if __name__ == "__main__":
         import traceback
         traceback.print_exc()
         sys.exit(1)
+
