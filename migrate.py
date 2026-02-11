@@ -59,7 +59,7 @@ CONFIG_FILE = SCRIPT_DIR / "migration_config.json"
 PGLOADER_TEMPLATE = SCRIPT_DIR / "pgloader" / "migration.load.template"
 PGLOADER_OUTPUT = SCRIPT_DIR / "pgloader" / "migration.load"
 DOCKER_NETWORK = "sql_default"
-PG_CONTAINER_NAME = "pg_target"
+PG_CONTAINER_NAME = "pg-target"
 PG_IMAGE = "postgres:16-alpine"
 PGLOADER_IMAGE = "dimitri/pgloader:latest"
 
@@ -381,6 +381,17 @@ def ensure_network(client: docker.DockerClient, name: str):
 
 def start_postgres(client: docker.DockerClient, pg: PGConfig) -> docker.models.containers.Container:
     """Start PostgreSQL container, or reuse if already running."""
+
+    # Remove legacy container name if exists (fixes pgloader underscore issue)
+    if PG_CONTAINER_NAME != "pg_target":
+        try:
+            legacy = client.containers.get("pg_target")
+            console.print("  [dim]Removing legacy container 'pg_target'...[/dim]")
+            legacy.remove(force=True)
+        except NotFound:
+            pass
+        except APIError:
+            pass
 
     # Check if container already exists
     try:
