@@ -1108,7 +1108,7 @@ def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
             console.print(table)
         else:
             color = "green" if all_passed else "red"
-            console.print(f"  [{color}]Row counts:[/color] {report['row_counts']['passed']}/{report['row_counts']['total']} tables match ✓")
+            console.print(f"  [{color}]Row counts:[/] {report['row_counts']['passed']}/{report['row_counts']['total']} tables match ✓")
 
     else:
         all_passed = False
