@@ -538,15 +538,19 @@ def generate_pgloader_config(mysql: MySQLConfig, pg: PGConfig) -> tuple[str, str
     target_uri = f"postgresql://{pg_user_encoded}:{pg_pw_encoded}@{target_host}:{target_port}/{pg_db_encoded}"
 
     try:
-        # Only format non-URI parts (like the database name for ALTER SCHEMA)
+        # Format non-URI parts (like the database name for ALTER SCHEMA)
         config = template.format(
             mysql_database=mysql.database,  # Raw DB name for identifiers
         )
         
+        # Replace URI markers with actual percent-encoded URIs
+        config = config.replace("$SOURCE_URI", source_uri)
+        config = config.replace("$TARGET_URI", target_uri)
+        
         # Debug output for user verification
         safe_source = f"mysql://{mysql_user_encoded}:****@{mysql.docker_host}:{mysql.port}/{mysql_db_encoded}"
         safe_target = f"postgresql://{pg_user_encoded}:****@{target_host}:{target_port}/{pg_db_encoded}"
-        console.print(f"  [dim]Generated URIs (passed via env):\n    Source: {safe_source}\n    Target: {safe_target}[/dim]")
+        console.print(f"  [dim]Generated URIs:\n    Source: {safe_source}\n    Target: {safe_target}[/dim]")
 
     except KeyError as e:
         console.print(
@@ -1231,10 +1235,6 @@ def run_pgloader_with_progress(client: docker.DockerClient, mysql_cfg: MySQLConf
             volumes={pgloader_dir: {"bind": "/pgloader", "mode": "ro"}},
             network=DOCKER_NETWORK,
             extra_hosts=extra_hosts,
-            environment={
-                "SOURCE_URI": source_uri,
-                "TARGET_URI": target_uri,
-            },
             remove=False,
         )
     except APIError as e:
