@@ -1,0 +1,32 @@
+// ═══════════════════════════════════════════════════════════════
+// Prisma Schema — PostgreSQL (Migrated from MySQL)
+// ═══════════════════════════════════════════════════════════════
+//
+// This is the INITIAL schema file. After running the migration
+// with pgloader, run `npx prisma db pull` to generate the
+// actual schema from the migrated database.
+//
+// This file will be OVERWRITTEN by `prisma db pull`.
+// ═══════════════════════════════════════════════════════════════
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────
+// After running `npx prisma db pull`, your models will appear
+// here automatically, generated from the PostgreSQL schema.
+//
+// Post-introspection checklist:
+//   □ Rename models to PascalCase (add @@map for DB name)
+//   □ Rename fields to camelCase (add @map for DB name)
+//   □ Add missing relations if FK not migrated
+//   □ Convert String fields to enum if desired
+//   □ Review DateTime fields map to correct Prisma types
+//   □ Verify Boolean fields (from TINYINT(1)) are correct
+// ─────────────────────────────────────────────────────────────

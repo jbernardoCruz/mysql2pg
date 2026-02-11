@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Environment & credentials
+.env
+migration_config.json
+
+# Auto-generated (runtime)
+pgloader/migration.load
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Prisma
+prisma/migrations/**/migration_lock.toml
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

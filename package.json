@@ -1,0 +1,19 @@
+{
+  "name": "mysql-to-postgres-migration",
+  "version": "1.0.0",
+  "description": "MySQL to PostgreSQL migration project with Prisma ORM",
+  "private": true,
+  "scripts": {
+    "prisma:pull": "npx prisma db pull",
+    "prisma:generate": "npx prisma generate",
+    "prisma:studio": "npx prisma studio",
+    "prisma:baseline": "npx prisma migrate resolve --applied 0_init",
+    "test:connection": "node scripts/test_connection.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.0.0"
+  },
+  "devDependencies": {
+    "prisma": "^6.0.0"
+  }
+}

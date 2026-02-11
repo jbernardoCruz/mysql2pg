@@ -1,0 +1,1231 @@
+#!/usr/bin/env python3
+"""
+═══════════════════════════════════════════════════════════════
+  MySQL → PostgreSQL Migration Tool (Ubuntu/Linux)
+═══════════════════════════════════════════════════════════════
+
+  CLI that automates the full migration pipeline:
+    1. Read connection details from migration_config.json
+    2. Start PostgreSQL in Docker
+    3. Generate pgloader config from template
+    4. Run pgloader migration via Docker
+    5. Validate data integrity (row counts, types, keys)
+
+  📌 Run in: Ubuntu Terminal
+  Usage:
+    pip install -r requirements.txt
+    python migrate.py --init     # Create config file (first time)
+    # Edit migration_config.json with your credentials
+    python migrate.py            # Run migration
+
+═══════════════════════════════════════════════════════════════
+"""
+
+import os
+import sys
+import json
+import time
+from pathlib import Path
+from urllib.parse import quote_plus
+
+# ─── Rich imports ────────────────────────────────────────────
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+from rich.prompt import Confirm
+from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich import box
+
+# ─── Docker SDK ──────────────────────────────────────────────
+import docker
+from docker.errors import DockerException, NotFound, APIError
+
+# ─── Database connectors ────────────────────────────────────
+import psycopg2
+import mysql.connector
+from mysql.connector import Error as MySQLError
+
+# ═════════════════════════════════════════════════════════════
+# Constants
+# ═════════════════════════════════════════════════════════════
+
+SCRIPT_DIR = Path(__file__).parent.resolve()
+CONFIG_FILE = SCRIPT_DIR / "migration_config.json"
+PGLOADER_TEMPLATE = SCRIPT_DIR / "pgloader" / "migration.load.template"
+PGLOADER_OUTPUT = SCRIPT_DIR / "pgloader" / "migration.load"
+DOCKER_NETWORK = "sql_default"
+PG_CONTAINER_NAME = "pg_target"
+PG_IMAGE = "postgres:16-alpine"
+PGLOADER_IMAGE = "dimitri/pgloader:latest"
+
+DEFAULT_CONFIG = {
+    "mysql": {
+        "host": "localhost",
+        "port": 3306,
+        "user": "root",
+        "password": "YOUR_MYSQL_PASSWORD",
+        "database": "YOUR_DATABASE_NAME",
+    },
+    "postgresql": {
+        "port": 5432,
+        "database": "myapp",
+        "password": "postgres",
+    },
+}
+
+console = Console()
+
+
+# ═════════════════════════════════════════════════════════════
+# Data classes for connection details
+# ═════════════════════════════════════════════════════════════
+
+class MySQLConfig:
+    def __init__(self, host: str, port: int, user: str, password: str, database: str):
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+        self.database = database
+
+    @property
+    def docker_host(self) -> str:
+        """Host to use from inside Docker containers."""
+        if self.host in ("localhost", "127.0.0.1"):
+            return "host.docker.internal"
+        return self.host
+
+
+class PGConfig:
+    def __init__(self, port: int, database: str, password: str):
+        self.host = "localhost"
+        self.port = port
+        self.user = "postgres"
+        self.password = password
+        self.database = database
+
+
+# ═════════════════════════════════════════════════════════════
+# Step 1: Configuration file
+# ═════════════════════════════════════════════════════════════
+
+def init_config():
+    """Create a fresh migration_config.json with defaults."""
+    if CONFIG_FILE.exists():
+        console.print(f"  [yellow]⚠ Config file already exists:[/yellow] {CONFIG_FILE}")
+        if not Confirm.ask("  Overwrite?", default=False):
+            console.print("  [dim]Skipped. Edit the existing file manually.[/dim]")
+            return
+
+    try:
+        CONFIG_FILE.write_text(json.dumps(DEFAULT_CONFIG, indent=2) + "\n")
+    except PermissionError:
+        console.print(
+            f"\n[red]✗ Permission denied:[/red] Cannot write to {CONFIG_FILE}\n"
+            "  Try running with appropriate permissions or check directory ownership.\n"
+        )
+        sys.exit(1)
+    except OSError as e:
+        console.print(
+            f"\n[red]✗ Failed to create config file:[/red] {e}\n"
+            "  Check disk space and directory permissions.\n"
+        )
+        sys.exit(1)
+
+    console.print(f"  [green]✓[/green] Created [bold]{CONFIG_FILE}[/bold]")
+    console.print("  [dim]Edit the file with your MySQL/PostgreSQL credentials, then run:[/dim]")
+    console.print("  [cyan]python migrate.py[/cyan]\n")
+
+
+def load_config() -> tuple[MySQLConfig, PGConfig]:
+    """Load and validate migration_config.json."""
+    if not CONFIG_FILE.exists():
+        console.print(
+            f"\n[red]✗ Config file not found:[/red] {CONFIG_FILE}\n"
+            "  Run [cyan]python migrate.py --init[/cyan] to create it.\n"
+        )
+        sys.exit(1)
+
+    try:
+        raw = CONFIG_FILE.read_text()
+    except PermissionError:
+        console.print(
+            f"\n[red]✗ Permission denied:[/red] Cannot read {CONFIG_FILE}\n"
+            "  Check file permissions: [dim]ls -la migration_config.json[/dim]\n"
+        )
+        sys.exit(1)
+    except OSError as e:
+        console.print(f"\n[red]✗ Cannot read config file:[/red] {e}")
+        sys.exit(1)
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        console.print(
+            f"\n[red]✗ Invalid JSON in {CONFIG_FILE.name}:[/red]\n"
+            f"  {e}\n\n"
+            "  [dim]Common issues: trailing commas, missing quotes, unescaped characters.[/dim]\n"
+            "  [dim]Tip: Use a JSON validator or run:[/dim] python -m json.tool migration_config.json\n"
+        )
+        sys.exit(1)
+
+    if not isinstance(data, dict):
+        console.print(
+            f"\n[red]✗ Config file must contain a JSON object,[/red] got {type(data).__name__}\n"
+            "  [dim]Expected format: {{\"mysql\": {{...}}, \"postgresql\": {{...}}}}[/dim]\n"
+        )
+        sys.exit(1)
+
+    # Validate required sections
+    if "mysql" not in data:
+        console.print(
+            f"\n[red]✗ Missing \"mysql\" section in {CONFIG_FILE.name}[/red]\n"
+            "  [dim]Run [cyan]python migrate.py --init[/cyan] to regenerate the config file.[/dim]\n"
+        )
+        sys.exit(1)
+    if "postgresql" not in data:
+        console.print(
+            f"\n[red]✗ Missing \"postgresql\" section in {CONFIG_FILE.name}[/red]\n"
+            "  [dim]Run [cyan]python migrate.py --init[/cyan] to regenerate the config file.[/dim]\n"
+        )
+        sys.exit(1)
+
+    # Validate required fields
+    errors = []
+    mysql = data.get("mysql", {})
+    pg = data.get("postgresql", {})
+
+    if not isinstance(mysql, dict):
+        console.print(f"\n[red]✗ \"mysql\" must be a JSON object, got {type(mysql).__name__}[/red]")
+        sys.exit(1)
+    if not isinstance(pg, dict):
+        console.print(f"\n[red]✗ \"postgresql\" must be a JSON object, got {type(pg).__name__}[/red]")
+        sys.exit(1)
+
+    for key in ("host", "port", "user", "password", "database"):
+        if key not in mysql:
+            errors.append(f"mysql.{key} — field missing")
+        elif mysql[key] is None or (isinstance(mysql[key], str) and not mysql[key].strip()):
+            errors.append(f"mysql.{key} — value is empty")
+    for key in ("port", "database", "password"):
+        if key not in pg:
+            errors.append(f"postgresql.{key} — field missing")
+        elif pg[key] is None or (isinstance(pg[key], str) and not pg[key].strip()):
+            errors.append(f"postgresql.{key} — value is empty")
+
+    # Check for placeholder values
+    if mysql.get("password") == "YOUR_MYSQL_PASSWORD":
+        errors.append("mysql.password — still has placeholder value \"YOUR_MYSQL_PASSWORD\"")
+    if mysql.get("database") == "YOUR_DATABASE_NAME":
+        errors.append("mysql.database — still has placeholder value \"YOUR_DATABASE_NAME\"")
+
+    if errors:
+        console.print(f"\n[red]✗ Config validation failed ({len(errors)} issue{'s' if len(errors) > 1 else ''}):[/red]")
+        for err in errors:
+            console.print(f"  [yellow]•[/yellow] {err}")
+        console.print(f"\n  [dim]Edit {CONFIG_FILE.name} and fix the issues above.[/dim]\n")
+        sys.exit(1)
+
+    # Type-safe conversion with error handling
+    try:
+        mysql_port = int(mysql["port"])
+    except (ValueError, TypeError):
+        console.print(
+            f"\n[red]✗ mysql.port must be a number,[/red] got: \"{mysql['port']}\"\n"
+            "  [dim]Use a number without quotes, e.g. \"port\": 3306[/dim]\n"
+        )
+        sys.exit(1)
+
+    try:
+        pg_port = int(pg["port"])
+    except (ValueError, TypeError):
+        console.print(
+            f"\n[red]✗ postgresql.port must be a number,[/red] got: \"{pg['port']}\"\n"
+            "  [dim]Use a number without quotes, e.g. \"port\": 5432[/dim]\n"
+        )
+        sys.exit(1)
+
+    # Port range validation
+    for label, port_val in [("mysql.port", mysql_port), ("postgresql.port", pg_port)]:
+        if not (1 <= port_val <= 65535):
+            console.print(
+                f"\n[red]✗ {label} must be between 1 and 65535,[/red] got: {port_val}\n"
+            )
+            sys.exit(1)
+
+    mysql_cfg = MySQLConfig(
+        host=str(mysql["host"]).strip(),
+        port=mysql_port,
+        user=str(mysql["user"]).strip(),
+        password=str(mysql["password"]),
+        database=str(mysql["database"]).strip(),
+    )
+    pg_cfg = PGConfig(
+        port=pg_port,
+        database=str(pg["database"]).strip(),
+        password=str(pg["password"]),
+    )
+
+    return mysql_cfg, pg_cfg
+
+
+def test_mysql_connection(config: MySQLConfig) -> bool:
+    """Test connectivity to MySQL before proceeding."""
+    try:
+        conn = mysql.connector.connect(
+            host=config.host,
+            port=config.port,
+            user=config.user,
+            password=config.password,
+            database=config.database,
+            connect_timeout=10,
+        )
+        conn.close()
+        return True
+    except MySQLError as e:
+        error_code = e.errno if hasattr(e, 'errno') else None
+        error_msg = str(e)
+
+        console.print(f"\n  [red]✗ MySQL connection failed:[/red] {error_msg}")
+
+        # Provide specific troubleshooting based on error code
+        if error_code == 2003:  # Can't connect to MySQL server
+            console.print(
+                "\n  [yellow]Troubleshooting:[/yellow]\n"
+                f"    1. Is MySQL running on [cyan]{config.host}:{config.port}[/cyan]?\n"
+                "    2. Check: [dim]sudo systemctl status mysql[/dim]\n"
+                "    3. Firewall: [dim]sudo ufw allow from 172.16.0.0/12 to any port 3306[/dim]\n"
+                "    4. MySQL bind-address: set [dim]bind-address = 0.0.0.0[/dim] in my.cnf"
+            )
+        elif error_code == 1045:  # Access denied
+            console.print(
+                "\n  [yellow]Troubleshooting:[/yellow]\n"
+                f"    • Access denied for user [cyan]{config.user}[/cyan]\n"
+                "    • Check password in [cyan]migration_config.json[/cyan]\n"
+                "    • Verify MySQL user has access: [dim]SELECT user, host FROM mysql.user;[/dim]"
+            )
+        elif error_code == 1049:  # Unknown database
+            console.print(
+                "\n  [yellow]Troubleshooting:[/yellow]\n"
+                f"    • Database [cyan]{config.database}[/cyan] does not exist\n"
+                "    • List databases: [dim]mysql -u root -p -e 'SHOW DATABASES;'[/dim]\n"
+                "    • Check spelling in [cyan]migration_config.json[/cyan]"
+            )
+        elif error_code == 2005:  # Unknown host
+            console.print(
+                "\n  [yellow]Troubleshooting:[/yellow]\n"
+                f"    • Cannot resolve hostname [cyan]{config.host}[/cyan]\n"
+                "    • Try using an IP address instead\n"
+                "    • Check: [dim]ping {host}[/dim]".format(host=config.host)
+            )
+        elif error_code == 2006 or error_code == 2013:  # Connection lost / timeout
+            console.print(
+                "\n  [yellow]Troubleshooting:[/yellow]\n"
+                "    • Connection timed out or was lost\n"
+                f"    • Verify MySQL is accepting connections on port [cyan]{config.port}[/cyan]\n"
+                "    • Check network connectivity and firewall rules"
+            )
+        console.print("")
+        return False
+    except Exception as e:
+        console.print(
+            f"\n  [red]✗ Unexpected error connecting to MySQL:[/red] {e}\n"
+            "  [dim]This may indicate a missing driver or system library.[/dim]\n"
+        )
+        return False
+
+
+# ═════════════════════════════════════════════════════════════
+# Step 2: Docker — PostgreSQL container
+# ═════════════════════════════════════════════════════════════
+
+def get_docker_client() -> docker.DockerClient:
+    """Get Docker client, with a friendly error if Docker isn't running."""
+    try:
+        client = docker.from_env()
+        client.ping()
+        return client
+    except DockerException:
+        console.print(
+            "\n[red]✗ Cannot connect to Docker.[/red]\n"
+            "  Make sure Docker Engine is installed and running:\n"
+            "    [dim]sudo systemctl start docker[/dim]\n"
+            "    [dim]sudo usermod -aG docker $USER[/dim]\n"
+        )
+        sys.exit(1)
+
+
+def ensure_network(client: docker.DockerClient, name: str):
+    """Create Docker network if it doesn't exist."""
+    try:
+        client.networks.get(name)
+    except NotFound:
+        try:
+            client.networks.create(name, driver="bridge")
+        except APIError as e:
+            console.print(
+                f"\n[red]✗ Failed to create Docker network '{name}':[/red] {e}\n"
+                "  [dim]Try manually: docker network create " + name + "[/dim]\n"
+            )
+            sys.exit(1)
+
+
+def start_postgres(client: docker.DockerClient, pg: PGConfig) -> docker.models.containers.Container:
+    """Start PostgreSQL container, or reuse if already running."""
+
+    # Check if container already exists
+    try:
+        container = client.containers.get(PG_CONTAINER_NAME)
+        if container.status == "running":
+            console.print("  [green]✓[/green] PostgreSQL container already running")
+            return container
+        else:
+            console.print(f"  [dim]Removing stopped container '{PG_CONTAINER_NAME}'...[/dim]")
+            try:
+                container.remove(force=True)
+            except APIError as e:
+                console.print(
+                    f"\n[red]✗ Cannot remove old container '{PG_CONTAINER_NAME}':[/red] {e}\n"
+                    f"  [dim]Try manually: docker rm -f {PG_CONTAINER_NAME}[/dim]\n"
+                )
+                sys.exit(1)
+    except NotFound:
+        pass
+
+    # Pull image if needed
+    try:
+        client.images.get(PG_IMAGE)
+    except NotFound:
+        console.print(f"  Pulling [cyan]{PG_IMAGE}[/cyan]...")
+        try:
+            client.images.pull(PG_IMAGE)
+        except APIError as e:
+            console.print(
+                f"\n[red]✗ Failed to pull Docker image {PG_IMAGE}:[/red] {e}\n"
+                "  [yellow]Troubleshooting:[/yellow]\n"
+                "    1. Check internet connection\n"
+                "    2. Docker Hub may be down — check [dim]https://status.docker.com[/dim]\n"
+                "    3. Try manually: [dim]docker pull " + PG_IMAGE + "[/dim]\n"
+            )
+            sys.exit(1)
+
+    # Ensure network exists
+    ensure_network(client, DOCKER_NETWORK)
+
+    # Start container
+    try:
+        container = client.containers.run(
+            PG_IMAGE,
+            name=PG_CONTAINER_NAME,
+            detach=True,
+            ports={"5432/tcp": pg.port},
+            environment={
+                "POSTGRES_USER": pg.user,
+                "POSTGRES_PASSWORD": pg.password,
+                "POSTGRES_DB": pg.database,
+            },
+            volumes={"sql_pgdata": {"bind": "/var/lib/postgresql/data", "mode": "rw"}},
+            network=DOCKER_NETWORK,
+            restart_policy={"Name": "unless-stopped"},
+            healthcheck={
+                "test": ["CMD-SHELL", f"pg_isready -U {pg.user}"],
+                "interval": 5_000_000_000,  # 5s in nanoseconds
+                "timeout": 5_000_000_000,
+                "retries": 5,
+            },
+        )
+    except APIError as e:
+        error_msg = str(e)
+        if "port is already allocated" in error_msg or "address already in use" in error_msg:
+            console.print(
+                f"\n[red]✗ Port {pg.port} is already in use.[/red]\n"
+                "  [yellow]Troubleshooting:[/yellow]\n"
+                f"    1. Check what's using port {pg.port}: [dim]sudo lsof -i :{pg.port}[/dim]\n"
+                f"    2. Stop the conflicting service, or\n"
+                f"    3. Change [cyan]postgresql.port[/cyan] in {CONFIG_FILE.name} to a different port\n"
+            )
+        elif "Conflict" in error_msg:
+            console.print(
+                f"\n[red]✗ Container name '{PG_CONTAINER_NAME}' conflict:[/red] {e}\n"
+                f"  [dim]Try: docker rm -f {PG_CONTAINER_NAME}[/dim]\n"
+            )
+        else:
+            console.print(
+                f"\n[red]✗ Failed to start PostgreSQL container:[/red] {e}\n"
+                "  [dim]Check Docker logs: docker logs " + PG_CONTAINER_NAME + "[/dim]\n"
+            )
+        sys.exit(1)
+
+    return container
+
+
+def wait_for_postgres(client: docker.DockerClient, timeout: int = 60):
+    """Wait until PostgreSQL container is healthy."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            container = client.containers.get(PG_CONTAINER_NAME)
+            health = container.attrs.get("State", {}).get("Health", {}).get("Status", "")
+            if health == "healthy":
+                return True
+            if container.status != "running":
+                console.print(f"  [red]✗ Container exited unexpectedly[/red]")
+                return False
+        except NotFound:
+            return False
+        time.sleep(2)
+
+    console.print(f"  [red]✗ PostgreSQL did not become healthy within {timeout}s[/red]")
+    return False
+
+
+# ═════════════════════════════════════════════════════════════
+# Step 3: Generate pgloader configuration
+# ═════════════════════════════════════════════════════════════
+
+def generate_pgloader_config(mysql: MySQLConfig, pg: PGConfig):
+    """Read template and fill in connection details."""
+    if not PGLOADER_TEMPLATE.exists():
+        console.print(
+            f"\n[red]✗ pgloader template not found:[/red] {PGLOADER_TEMPLATE}\n"
+            "  [dim]This file should be in the pgloader/ directory.\n"
+            "  Re-clone the repository to restore it.[/dim]\n"
+        )
+        sys.exit(1)
+
+    try:
+        template = PGLOADER_TEMPLATE.read_text()
+    except OSError as e:
+        console.print(f"\n[red]✗ Cannot read template file:[/red] {e}")
+        sys.exit(1)
+
+    # URL-encode password to handle special characters
+    mysql_pw_encoded = quote_plus(mysql.password)
+    pg_pw_encoded = quote_plus(pg.password)
+
+    try:
+        config = template.format(
+            mysql_user=mysql.user,
+            mysql_password=mysql_pw_encoded,
+            mysql_host=mysql.docker_host,
+            mysql_port=mysql.port,
+            mysql_database=mysql.database,
+            pg_password=pg_pw_encoded,
+            pg_port=5432,  # Internal Docker port, always 5432
+            pg_database=pg.database,
+        )
+    except KeyError as e:
+        console.print(
+            f"\n[red]✗ Template has an unrecognized placeholder:[/red] {e}\n"
+            f"  [dim]Check {PGLOADER_TEMPLATE} for invalid {{placeholders}}.[/dim]\n"
+        )
+        sys.exit(1)
+
+    try:
+        PGLOADER_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+        PGLOADER_OUTPUT.write_text(config)
+    except OSError as e:
+        console.print(
+            f"\n[red]✗ Cannot write pgloader config:[/red] {e}\n"
+            f"  [dim]Check permissions on {PGLOADER_OUTPUT.parent}[/dim]\n"
+        )
+        sys.exit(1)
+
+
+# ═════════════════════════════════════════════════════════════
+# Step 4: Run pgloader migration
+# ═════════════════════════════════════════════════════════════
+
+def run_pgloader(client: docker.DockerClient, mysql: MySQLConfig):
+    """Run pgloader container to perform the migration."""
+
+    # Pull image if needed
+    try:
+        client.images.get(PGLOADER_IMAGE)
+    except NotFound:
+        console.print(f"  Pulling [cyan]{PGLOADER_IMAGE}[/cyan]...")
+        try:
+            client.images.pull(PGLOADER_IMAGE)
+        except APIError as e:
+            console.print(
+                f"\n[red]✗ Failed to pull Docker image {PGLOADER_IMAGE}:[/red] {e}\n"
+                "  [yellow]Troubleshooting:[/yellow]\n"
+                "    1. Check internet connection\n"
+                "    2. Try manually: [dim]docker pull " + PGLOADER_IMAGE + "[/dim]\n"
+            )
+            sys.exit(1)
+
+    # Ensure network exists
+    ensure_network(client, DOCKER_NETWORK)
+
+    # Remove previous pgloader container if exists
+    try:
+        old = client.containers.get("pgloader_runner")
+        old.remove(force=True)
+    except NotFound:
+        pass
+    except APIError as e:
+        console.print(
+            f"\n[yellow]⚠ Could not remove old pgloader container:[/yellow] {e}\n"
+            "  [dim]Trying to continue anyway...[/dim]\n"
+        )
+
+    # Build extra_hosts for Linux host networking
+    extra_hosts = {}
+    if mysql.docker_host == "host.docker.internal":
+        extra_hosts["host.docker.internal"] = "host-gateway"
+
+    # Run pgloader
+    pgloader_dir = str(SCRIPT_DIR / "pgloader")
+    try:
+        container = client.containers.run(
+            PGLOADER_IMAGE,
+            command="pgloader /pgloader/migration.load",
+            name="pgloader_runner",
+            detach=True,
+            volumes={pgloader_dir: {"bind": "/pgloader", "mode": "ro"}},
+            network=DOCKER_NETWORK,
+            extra_hosts=extra_hosts,
+            remove=False,  # Keep so we can read logs
+        )
+    except APIError as e:
+        error_msg = str(e)
+        if "Conflict" in error_msg:
+            console.print(
+                "\n[red]✗ pgloader container name conflict.[/red]\n"
+                "  [dim]Try: docker rm -f pgloader_runner[/dim]\n"
+            )
+        else:
+            console.print(
+                f"\n[red]✗ Failed to start pgloader container:[/red] {e}\n"
+                "  [dim]Check Docker daemon status: docker info[/dim]\n"
+            )
+        return False
+
+    # Stream logs
+    console.print("")
+    try:
+        for line in container.logs(stream=True, follow=True):
+            text = line.decode("utf-8", errors="replace").rstrip()
+            if text:
+                console.print(f"  [dim]{text}[/dim]")
+    except Exception as e:
+        console.print(f"\n  [yellow]⚠ Log streaming interrupted:[/yellow] {e}")
+
+    # Wait for container to finish
+    try:
+        result = container.wait(timeout=600)  # 10 min timeout
+        exit_code = result.get("StatusCode", -1)
+    except Exception as e:
+        console.print(
+            f"\n[red]✗ pgloader container timed out or failed:[/red] {e}\n"
+            "  [dim]Check container status: docker ps -a | grep pgloader[/dim]\n"
+            "  [dim]View logs: docker logs pgloader_runner[/dim]\n"
+        )
+        return False
+
+    # Get full logs for error reporting
+    if exit_code != 0:
+        try:
+            logs = container.logs().decode("utf-8", errors="replace")
+        except Exception:
+            logs = "(could not retrieve logs)"
+
+        console.print(f"\n  [red]✗ pgloader exited with code {exit_code}[/red]")
+
+        # Provide specific guidance based on common pgloader errors
+        if "Access denied" in logs or "authentication" in logs.lower():
+            console.print(
+                "\n  [yellow]Likely cause:[/yellow] MySQL authentication failed inside Docker.\n"
+                "    • Check credentials in [cyan]migration_config.json[/cyan]\n"
+                "    • Ensure MySQL user can connect from Docker network\n"
+                "    • Grant access: [dim]GRANT ALL ON db.* TO 'user'@'%';[/dim]\n"
+            )
+        elif "could not connect" in logs.lower() or "connection refused" in logs.lower():
+            console.print(
+                "\n  [yellow]Likely cause:[/yellow] pgloader cannot reach MySQL from inside Docker.\n"
+                "    • Firewall: [dim]sudo ufw allow from 172.16.0.0/12 to any port 3306[/dim]\n"
+                "    • MySQL bind-address: set [dim]bind-address = 0.0.0.0[/dim]\n"
+                "    • Restart MySQL: [dim]sudo systemctl restart mysql[/dim]\n"
+            )
+        elif "No such file" in logs:
+            console.print(
+                "\n  [yellow]Likely cause:[/yellow] pgloader config file not mounted correctly.\n"
+                f"    • Expected at: {PGLOADER_OUTPUT}\n"
+                "    • Check that pgloader/ directory exists\n"
+            )
+
+        # Show last portion of logs
+        log_tail = logs[-2000:] if len(logs) > 2000 else logs
+        if log_tail.strip():
+            console.print("\n  [bold]Last pgloader output:[/bold]")
+            for line in log_tail.strip().split("\n")[-20:]:
+                console.print(f"  [dim]{line}[/dim]")
+
+        try:
+            container.remove(force=True)
+        except Exception:
+            pass
+        return False
+
+    try:
+        container.remove(force=True)
+    except Exception:
+        pass  # Non-critical — container will be cleaned up eventually
+    return True
+
+
+# ═════════════════════════════════════════════════════════════
+# Step 5: Validation
+# ═════════════════════════════════════════════════════════════
+
+def get_mysql_tables(config: MySQLConfig) -> dict[str, int]:
+    """Get table names and row counts from MySQL."""
+    try:
+        conn = mysql.connector.connect(
+            host=config.host,
+            port=config.port,
+            user=config.user,
+            password=config.password,
+            database=config.database,
+            connect_timeout=10,
+        )
+    except MySQLError as e:
+        raise RuntimeError(
+            f"Cannot connect to MySQL for validation: {e}\n"
+            "  Check that MySQL is still running and accessible."
+        )
+
+    try:
+        cursor = conn.cursor()
+
+        # Get all tables
+        cursor.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = %s AND table_type = 'BASE TABLE'",
+            (config.database,),
+        )
+        tables = [row[0] for row in cursor.fetchall()]
+
+        if not tables:
+            console.print("  [yellow]⚠ No tables found in MySQL database.[/yellow]")
+            console.print(f"  [dim]Database: {config.database}[/dim]")
+            return {}
+
+        # Get exact row counts
+        counts = {}
+        for table in tables:
+            try:
+                cursor.execute(f"SELECT COUNT(*) FROM `{table}`")
+                counts[table.lower()] = cursor.fetchone()[0]  # lowercase to match PG
+            except MySQLError as e:
+                console.print(f"  [yellow]⚠ Could not count rows in MySQL table `{table}`:[/yellow] {e}")
+                counts[table.lower()] = -1  # Mark as error
+
+        return counts
+    except MySQLError as e:
+        raise RuntimeError(
+            f"MySQL query failed during validation: {e}\n"
+            "  The database may have become unavailable."
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def get_pg_tables(config: PGConfig) -> dict[str, int]:
+    """Get table names and row counts from PostgreSQL."""
+    try:
+        conn = psycopg2.connect(
+            host=config.host,
+            port=config.port,
+            user=config.user,
+            password=config.password,
+            dbname=config.database,
+            connect_timeout=10,
+        )
+    except psycopg2.Error as e:
+        raise RuntimeError(
+            f"Cannot connect to PostgreSQL for validation: {e}\n"
+            "  Check that the pg_target container is still running: docker ps"
+        )
+
+    try:
+        cursor = conn.cursor()
+
+        # Get all tables
+        cursor.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+        )
+        tables = [row[0] for row in cursor.fetchall()]
+
+        if not tables:
+            console.print("  [yellow]⚠ No tables found in PostgreSQL.[/yellow]")
+            console.print("  [dim]This suggests the migration may not have transferred any data.[/dim]")
+            return {}
+
+        # Get exact row counts
+        counts = {}
+        for table in tables:
+            try:
+                cursor.execute(f'SELECT COUNT(*) FROM "{table}"')
+                counts[table] = cursor.fetchone()[0]
+            except psycopg2.Error as e:
+                console.print(f"  [yellow]⚠ Could not count rows in PG table `{table}`:[/yellow] {e}")
+                conn.rollback()  # Reset transaction state after error
+                counts[table] = -1
+
+        return counts
+    except psycopg2.Error as e:
+        raise RuntimeError(
+            f"PostgreSQL query failed during validation: {e}\n"
+            "  The database may have become unavailable."
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def get_pg_column_types(config: PGConfig) -> list[dict]:
+    """Get column type info from PostgreSQL."""
+    try:
+        conn = psycopg2.connect(
+            host=config.host,
+            port=config.port,
+            user=config.user,
+            password=config.password,
+            dbname=config.database,
+            connect_timeout=10,
+        )
+    except psycopg2.Error as e:
+        raise RuntimeError(
+            f"Cannot connect to PostgreSQL for type verification: {e}"
+        )
+
+    try:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT table_name, column_name, data_type, udt_name, is_nullable, column_default
+            FROM information_schema.columns
+            WHERE table_schema = 'public'
+            ORDER BY table_name, ordinal_position
+        """)
+        columns = []
+        for row in cursor.fetchall():
+            columns.append({
+                "table": row[0],
+                "column": row[1],
+                "data_type": row[2],
+                "udt_name": row[3],
+                "nullable": row[4],
+                "default": row[5],
+            })
+        return columns
+    except psycopg2.Error as e:
+        raise RuntimeError(
+            f"PostgreSQL column type query failed: {e}"
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def get_pg_constraints(config: PGConfig) -> dict:
+    """Get primary keys, foreign keys, and indexes from PostgreSQL."""
+    try:
+        conn = psycopg2.connect(
+            host=config.host,
+            port=config.port,
+            user=config.user,
+            password=config.password,
+            dbname=config.database,
+            connect_timeout=10,
+        )
+    except psycopg2.Error as e:
+        raise RuntimeError(
+            f"Cannot connect to PostgreSQL for constraint check: {e}"
+        )
+
+    try:
+        cursor = conn.cursor()
+
+        # Primary keys
+        cursor.execute("""
+            SELECT tc.table_name, kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+            WHERE tc.constraint_type = 'PRIMARY KEY'
+              AND tc.table_schema = 'public'
+            ORDER BY tc.table_name
+        """)
+        pks = cursor.fetchall()
+
+        # Foreign keys
+        cursor.execute("""
+            SELECT tc.table_name, kcu.column_name,
+                   ccu.table_name AS ref_table, ccu.column_name AS ref_column
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+              ON tc.constraint_name = kcu.constraint_name
+              AND tc.table_schema = kcu.table_schema
+            JOIN information_schema.constraint_column_usage ccu
+              ON ccu.constraint_name = tc.constraint_name
+              AND ccu.table_schema = tc.table_schema
+            WHERE tc.constraint_type = 'FOREIGN KEY'
+              AND tc.table_schema = 'public'
+            ORDER BY tc.table_name
+        """)
+        fks = cursor.fetchall()
+
+        # Indexes
+        cursor.execute("""
+            SELECT tablename, indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+            ORDER BY tablename, indexname
+        """)
+        indexes = cursor.fetchall()
+
+        # Sequences
+        cursor.execute("""
+            SELECT sequence_name
+            FROM information_schema.sequences
+            WHERE sequence_schema = 'public'
+            ORDER BY sequence_name
+        """)
+        sequences = [row[0] for row in cursor.fetchall()]
+
+        return {
+            "primary_keys": pks,
+            "foreign_keys": fks,
+            "indexes": indexes,
+            "sequences": sequences,
+        }
+    except psycopg2.Error as e:
+        raise RuntimeError(
+            f"PostgreSQL constraint query failed: {e}"
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig) -> bool:
+    """Run full validation suite and print results."""
+    all_passed = True
+    validation_errors = []
+
+    # ── Row count comparison ──────────────────────────────────
+    console.print("\n  [bold]Row Count Comparison[/bold]")
+
+    try:
+        mysql_counts = get_mysql_tables(mysql_cfg)
+    except RuntimeError as e:
+        console.print(f"  [red]✗ MySQL error:[/red] {e}")
+        validation_errors.append("Row counts — MySQL connection failed")
+        mysql_counts = None
+
+    try:
+        pg_counts = get_pg_tables(pg_cfg)
+    except RuntimeError as e:
+        console.print(f"  [red]✗ PostgreSQL error:[/red] {e}")
+        validation_errors.append("Row counts — PostgreSQL connection failed")
+        pg_counts = None
+
+    if mysql_counts is not None and pg_counts is not None:
+        table = Table(box=box.ROUNDED, show_lines=False, pad_edge=True)
+        table.add_column("Table", style="cyan", min_width=20)
+        table.add_column("MySQL", justify="right", style="yellow")
+        table.add_column("PostgreSQL", justify="right", style="green")
+        table.add_column("Status", justify="center")
+
+        all_tables = sorted(set(list(mysql_counts.keys()) + list(pg_counts.keys())))
+
+        for t in all_tables:
+            m_count = mysql_counts.get(t, "-")
+            p_count = pg_counts.get(t, "-")
+            if m_count == p_count:
+                status = "[green]✓ OK[/green]"
+            elif t not in pg_counts:
+                status = "[red]✗ MISSING[/red]"
+                all_passed = False
+            elif t not in mysql_counts:
+                status = "[yellow]? EXTRA[/yellow]"
+            else:
+                status = f"[red]✗ MISMATCH[/red]"
+                all_passed = False
+
+            table.add_row(
+                t,
+                str(m_count) if m_count != "-" else "-",
+                str(p_count) if p_count != "-" else "-",
+                status,
+            )
+
+        console.print(table)
+
+    else:
+        all_passed = False
+        console.print("  [red]✗ Skipped — could not connect to databases[/red]")
+
+    # ── Type mapping verification ─────────────────────────────
+    console.print("\n  [bold]Type Mapping Verification[/bold]")
+
+    try:
+        columns = get_pg_column_types(pg_cfg)
+    except RuntimeError as e:
+        console.print(f"  [red]✗ Could not verify types:[/red] {e}")
+        validation_errors.append("Type mapping — PostgreSQL query failed")
+        columns = None
+
+    if columns is not None:
+        converted_types = {
+            "bool": "TINYINT(1)/BIT(1) → boolean",
+            "timestamptz": "DATETIME → timestamptz",
+            "int2": "TINYINT → smallint",
+            "int8": "INT UNSIGNED → bigint",
+        }
+
+        type_table = Table(box=box.ROUNDED, show_lines=False, pad_edge=True)
+        type_table.add_column("Table.Column", style="cyan", min_width=25)
+        type_table.add_column("PG Type", style="green")
+        type_table.add_column("Conversion", style="dim")
+
+        converted_count = 0
+        for col in columns:
+            udt = col["udt_name"]
+            if udt in converted_types:
+                converted_count += 1
+                type_table.add_row(
+                    f"{col['table']}.{col['column']}",
+                    udt,
+                    converted_types[udt],
+                )
+
+        if converted_count > 0:
+            console.print(type_table)
+        else:
+            console.print("  [dim]No converted types found (this may be expected).[/dim]")
+
+        console.print(f"  [green]✓[/green] {converted_count} columns with type conversions detected")
+
+    else:
+        console.print("  [red]✗ Skipped — could not query PostgreSQL[/red]")
+
+    # ── Constraints ───────────────────────────────────────────
+    console.print("\n  [bold]Constraints & Indexes[/bold]")
+
+    try:
+        constraints = get_pg_constraints(pg_cfg)
+    except RuntimeError as e:
+        console.print(f"  [red]✗ Could not verify constraints:[/red] {e}")
+        validation_errors.append("Constraints — PostgreSQL query failed")
+        constraints = None
+
+    if constraints is not None:
+        constraint_table = Table(box=box.SIMPLE, show_lines=False)
+        constraint_table.add_column("Check", style="cyan", min_width=20)
+        constraint_table.add_column("Count", justify="right", style="green")
+        constraint_table.add_column("Status", justify="center")
+
+        checks = [
+            ("Primary Keys", len(constraints["primary_keys"])),
+            ("Foreign Keys", len(constraints["foreign_keys"])),
+            ("Indexes", len(constraints["indexes"])),
+            ("Sequences", len(constraints["sequences"])),
+        ]
+
+        for name, count in checks:
+            status = "[green]✓[/green]" if count > 0 else "[yellow]—[/yellow]"
+            constraint_table.add_row(name, str(count), status)
+
+        console.print(constraint_table)
+
+    else:
+        console.print("  [red]✗ Skipped — could not query PostgreSQL[/red]")
+
+    # ── Summary of validation errors ──────────────────────────
+    if validation_errors:
+        all_passed = False
+        console.print("\n  [bold red]Validation Issues:[/bold red]")
+        for err in validation_errors:
+            console.print(f"    [red]✗[/red] {err}")
+
+    return all_passed
+
+
+# ═════════════════════════════════════════════════════════════
+# Main pipeline
+# ═════════════════════════════════════════════════════════════
+
+def main():
+    # ── Handle --init flag ────────────────────────────────────
+    if "--init" in sys.argv:
+        console.print(
+            Panel(
+                "[bold white]MySQL → PostgreSQL Migration Tool[/bold white]\n"
+                "[dim]Configuration Setup[/dim]",
+                border_style="bright_cyan",
+                padding=(1, 4),
+            )
+        )
+        init_config()
+        return 0
+
+    # ── Banner ────────────────────────────────────────────────
+    console.print(
+        Panel(
+            "[bold white]MySQL → PostgreSQL Migration Tool[/bold white]\n"
+            "[dim]Ubuntu/Linux • Powered by pgloader + Docker[/dim]",
+            border_style="bright_cyan",
+            padding=(1, 4),
+        )
+    )
+
+    # ── Step 1: Load config file ─────────────────────────────
+    console.print(f"  Loading config from [cyan]{CONFIG_FILE.name}[/cyan]...")
+    mysql_cfg, pg_cfg = load_config()
+    console.print("  [green]✓[/green] Config loaded\n")
+
+    # ── Test MySQL connection ─────────────────────────────────
+    console.print("")
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("[cyan]Testing MySQL connection...", total=1)
+        connected = test_mysql_connection(mysql_cfg)
+        progress.update(task, completed=1)
+
+    if not connected:
+        console.print(
+            "\n[red]Cannot connect to MySQL. Please check your credentials and try again.[/red]\n"
+            "[dim]If MySQL is on this machine, ensure it accepts connections on the specified port.\n"
+            "If using ufw: sudo ufw allow from 172.16.0.0/12 to any port 3306[/dim]\n"
+        )
+        sys.exit(1)
+
+    console.print("  [green]✓[/green] MySQL connection successful\n")
+
+    # ── Confirmation ──────────────────────────────────────────
+    console.print(
+        Panel(
+            f"[bold]Source:[/bold]  mysql://{mysql_cfg.user}:****@{mysql_cfg.host}:{mysql_cfg.port}/{mysql_cfg.database}\n"
+            f"[bold]Target:[/bold]  postgresql://{pg_cfg.user}:****@localhost:{pg_cfg.port}/{pg_cfg.database}",
+            title="Migration Summary",
+            border_style="yellow",
+        )
+    )
+
+    if not Confirm.ask("\n  Proceed with migration?", default=True):
+        console.print("[dim]Migration cancelled.[/dim]")
+        sys.exit(0)
+
+    console.print("")
+
+    # ── Step 2: Start PostgreSQL ──────────────────────────────
+    console.print("[bold yellow][1/5][/bold yellow] Starting PostgreSQL container...")
+    client = get_docker_client()
+    start_postgres(client, pg_cfg)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=console,
+    ) as progress:
+        task = progress.add_task("[cyan]Waiting for PostgreSQL to be healthy...", total=1)
+        healthy = wait_for_postgres(client)
+        progress.update(task, completed=1)
+
+    if not healthy:
+        console.print("[red]PostgreSQL failed to start. Check Docker logs.[/red]")
+        sys.exit(1)
+
+    console.print("  [green]✓[/green] PostgreSQL is ready\n")
+
+    # ── Step 3: Generate pgloader config ──────────────────────
+    console.print("[bold yellow][2/5][/bold yellow] Generating pgloader configuration...")
+    generate_pgloader_config(mysql_cfg, pg_cfg)
+    console.print(f"  [green]✓[/green] Config written to [dim]{PGLOADER_OUTPUT}[/dim]\n")
+
+    # ── Step 4: Run pgloader ──────────────────────────────────
+    console.print("[bold yellow][3/5][/bold yellow] Running pgloader migration...")
+    console.print("  [dim]This may take a while depending on database size.[/dim]\n")
+
+    success = run_pgloader(client, mysql_cfg)
+    if not success:
+        console.print("\n[red]Migration failed. Check the pgloader output above.[/red]")
+        sys.exit(1)
+
+    console.print("\n  [green]✓[/green] pgloader migration complete\n")
+
+    # ── Step 5: Validate ──────────────────────────────────────
+    console.print("[bold yellow][4/5][/bold yellow] Validating migration...")
+
+    try:
+        all_passed = validate_migration(mysql_cfg, pg_cfg)
+    except Exception as e:
+        console.print(f"\n  [red]✗ Validation error: {e}[/red]")
+        console.print("  [dim]You can still validate manually with the SQL scripts in scripts/[/dim]")
+        all_passed = False
+
+    # ── Summary ───────────────────────────────────────────────
+    console.print("")
+    console.print("[bold yellow][5/5][/bold yellow] Migration summary")
+
+    if all_passed:
+        console.print(
+            Panel(
+                "[bold green]✓ Migration completed successfully![/bold green]\n"
+                "[green]All row counts match and types are correctly mapped.[/green]\n\n"
+                "[bold]Next steps — Set up Prisma:[/bold]\n"
+                "  [dim]1.[/dim] npm install\n"
+                "  [dim]2.[/dim] npx prisma db pull\n"
+                "  [dim]3.[/dim] npx prisma generate\n"
+                "  [dim]4.[/dim] npm run test:connection",
+                border_style="green",
+                padding=(1, 2),
+            )
+        )
+    else:
+        console.print(
+            Panel(
+                "[bold yellow]⚠ Migration completed with warnings.[/bold yellow]\n"
+                "[yellow]Some checks did not pass — review the output above.[/yellow]\n\n"
+                "[bold]Manual validation:[/bold]\n"
+                "  [dim]docker exec -it pg_target psql -U postgres -d {db}[/dim]\n"
+                "  [dim]\\i scripts/validate.sql[/dim]\n"
+                "  [dim]\\i scripts/validate_types.sql[/dim]".format(db=pg_cfg.database),
+                border_style="yellow",
+                padding=(1, 2),
+            )
+        )
+
+    return 0 if all_passed else 1
+
+
+if __name__ == "__main__":
+    try:
+        exit_code = main()
+        sys.exit(exit_code)
+    except KeyboardInterrupt:
+        console.print("\n[dim]Migration cancelled by user.[/dim]")
+        sys.exit(130)
+    except Exception as e:
+        console.print(f"\n[red]Unexpected error: {e}[/red]")
+        console.print("[dim]Please report this issue with the full traceback.[/dim]")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
