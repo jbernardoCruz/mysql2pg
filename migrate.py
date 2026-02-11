@@ -790,7 +790,57 @@ def get_mysql_tables(config: MySQLConfig) -> dict[str, int]:
             pass
 
 
-def get_pg_tables(config: PGConfig) -> dict[str, int]:
+def discover_pg_schema(config: PGConfig, mysql_database: str) -> str:
+    """Discover which schema pgloader put tables into.
+    
+    pgloader may create tables in 'public' or in a schema matching
+    the MySQL database name, depending on ALTER SCHEMA success.
+    """
+    try:
+        conn = psycopg2.connect(
+            host=config.host,
+            port=config.port,
+            user=config.user,
+            password=config.password,
+            dbname=config.database,
+            connect_timeout=10,
+        )
+        cursor = conn.cursor()
+        # Check which schemas have tables
+        cursor.execute("""
+            SELECT table_schema, COUNT(*) as table_count
+            FROM information_schema.tables
+            WHERE table_type = 'BASE TABLE'
+              AND table_schema NOT IN ('pg_catalog', 'information_schema')
+            GROUP BY table_schema
+            ORDER BY table_count DESC
+        """)
+        schemas = {row[0]: row[1] for row in cursor.fetchall()}
+        conn.close()
+
+        if not schemas:
+            return 'public'  # Fallback
+
+        # Prefer the MySQL database name schema if it has tables
+        mysql_db_lower = mysql_database.lower()
+        if mysql_db_lower in schemas:
+            console.print(f"  [dim]Found tables in schema: '{mysql_db_lower}'[/dim]")
+            return mysql_db_lower
+        
+        # Otherwise use 'public' if it has tables
+        if 'public' in schemas:
+            return 'public'
+        
+        # Use whichever schema has the most tables
+        best = max(schemas, key=schemas.get)
+        console.print(f"  [dim]Found tables in schema: '{best}'[/dim]")
+        return best
+
+    except psycopg2.Error:
+        return 'public'  # Fallback
+
+
+def get_pg_tables(config: PGConfig, schema: str = 'public') -> dict[str, int]:
     """Get table names and row counts from PostgreSQL."""
     try:
         conn = psycopg2.connect(
@@ -813,7 +863,8 @@ def get_pg_tables(config: PGConfig) -> dict[str, int]:
         # Get all tables
         cursor.execute(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = 'public' AND table_type = 'BASE TABLE'"
+            "WHERE table_schema = %s AND table_type = 'BASE TABLE'",
+            (schema,)
         )
         tables = [row[0] for row in cursor.fetchall()]
 
@@ -826,7 +877,7 @@ def get_pg_tables(config: PGConfig) -> dict[str, int]:
         counts = {}
         for table in tables:
             try:
-                cursor.execute(f'SELECT COUNT(*) FROM "{table}"')
+                cursor.execute(f'SELECT COUNT(*) FROM "{schema}"."{table}"')
                 counts[table] = cursor.fetchone()[0]
             except psycopg2.Error as e:
                 console.print(f"  [yellow]⚠ Could not count rows in PG table `{table}`:[/yellow] {e}")
@@ -846,7 +897,7 @@ def get_pg_tables(config: PGConfig) -> dict[str, int]:
             pass
 
 
-def get_pg_column_types(config: PGConfig) -> list[dict]:
+def get_pg_column_types(config: PGConfig, schema: str = 'public') -> list[dict]:
     """Get column type info from PostgreSQL."""
     try:
         conn = psycopg2.connect(
@@ -867,9 +918,9 @@ def get_pg_column_types(config: PGConfig) -> list[dict]:
         cursor.execute("""
             SELECT table_name, column_name, data_type, udt_name, is_nullable, column_default
             FROM information_schema.columns
-            WHERE table_schema = 'public'
+            WHERE table_schema = %s
             ORDER BY table_name, ordinal_position
-        """)
+        """, (schema,))
         columns = []
         for row in cursor.fetchall():
             columns.append({
@@ -892,7 +943,7 @@ def get_pg_column_types(config: PGConfig) -> list[dict]:
             pass
 
 
-def get_pg_constraints(config: PGConfig) -> dict:
+def get_pg_constraints(config: PGConfig, schema: str = 'public') -> dict:
     """Get primary keys, foreign keys, and indexes from PostgreSQL."""
     try:
         conn = psycopg2.connect(
@@ -919,9 +970,9 @@ def get_pg_constraints(config: PGConfig) -> dict:
               ON tc.constraint_name = kcu.constraint_name
               AND tc.table_schema = kcu.table_schema
             WHERE tc.constraint_type = 'PRIMARY KEY'
-              AND tc.table_schema = 'public'
+              AND tc.table_schema = %s
             ORDER BY tc.table_name
-        """)
+        """, (schema,))
         pks = cursor.fetchall()
 
         # Foreign keys
@@ -936,27 +987,27 @@ def get_pg_constraints(config: PGConfig) -> dict:
               ON ccu.constraint_name = tc.constraint_name
               AND ccu.table_schema = tc.table_schema
             WHERE tc.constraint_type = 'FOREIGN KEY'
-              AND tc.table_schema = 'public'
+              AND tc.table_schema = %s
             ORDER BY tc.table_name
-        """)
+        """, (schema,))
         fks = cursor.fetchall()
 
         # Indexes
         cursor.execute("""
             SELECT tablename, indexname
             FROM pg_indexes
-            WHERE schemaname = 'public'
+            WHERE schemaname = %s
             ORDER BY tablename, indexname
-        """)
+        """, (schema,))
         indexes = cursor.fetchall()
 
         # Sequences
         cursor.execute("""
             SELECT sequence_name
             FROM information_schema.sequences
-            WHERE sequence_schema = 'public'
+            WHERE sequence_schema = %s
             ORDER BY sequence_name
-        """)
+        """, (schema,))
         sequences = [row[0] for row in cursor.fetchall()]
 
         return {
@@ -976,7 +1027,7 @@ def get_pg_constraints(config: PGConfig) -> dict:
             pass
 
 
-def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig) -> bool:
+def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database: str) -> bool:
     """Run full validation suite and print results."""
     all_passed = True
     validation_errors = []
@@ -992,7 +1043,10 @@ def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig) -> bool:
         mysql_counts = None
 
     try:
-        pg_counts = get_pg_tables(pg_cfg)
+        # Discover which schema pgloader used
+        target_schema = discover_pg_schema(pg_cfg, mysql_database)
+        console.print(f"  [dim]Validating against schema: '{target_schema}'[/dim]")
+        pg_counts = get_pg_tables(pg_cfg, schema=target_schema)
     except RuntimeError as e:
         console.print(f"  [red]✗ PostgreSQL error:[/red] {e}")
         validation_errors.append("Row counts — PostgreSQL connection failed")
@@ -1038,7 +1092,7 @@ def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig) -> bool:
     console.print("\n  [bold]Type Mapping Verification[/bold]")
 
     try:
-        columns = get_pg_column_types(pg_cfg)
+        columns = get_pg_column_types(pg_cfg, schema=target_schema)
     except RuntimeError as e:
         console.print(f"  [red]✗ Could not verify types:[/red] {e}")
         validation_errors.append("Type mapping — PostgreSQL query failed")
@@ -1082,7 +1136,7 @@ def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig) -> bool:
     console.print("\n  [bold]Constraints & Indexes[/bold]")
 
     try:
-        constraints = get_pg_constraints(pg_cfg)
+        constraints = get_pg_constraints(pg_cfg, schema=target_schema)
     except RuntimeError as e:
         console.print(f"  [red]✗ Could not verify constraints:[/red] {e}")
         validation_errors.append("Constraints — PostgreSQL query failed")
@@ -1392,7 +1446,7 @@ def run_pgloader_with_progress(client: docker.DockerClient, mysql_cfg: MySQLConf
 # Step 8: Schema diff report
 # ═════════════════════════════════════════════════════════════
 
-def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig):
+def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database: str):
     """Compare MySQL vs PostgreSQL schemas and highlight type conversions."""
     console.print("\n  [bold]Schema Diff Report[/bold]")
     console.print("  [dim]Comparing MySQL source types → PostgreSQL target types[/dim]\n")
@@ -1406,7 +1460,8 @@ def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig):
 
     # Get PG schema
     try:
-        pg_cols = get_pg_column_types(pg_cfg)
+        target_schema = discover_pg_schema(pg_cfg, mysql_database)
+        pg_cols = get_pg_column_types(pg_cfg, schema=target_schema)
     except RuntimeError as e:
         console.print(f"  [red]✗ Cannot read PostgreSQL schema:[/red] {e}")
         return
@@ -1818,7 +1873,7 @@ def main():
     console.print("[bold yellow][4/6][/bold yellow] Validating migration...")
 
     try:
-        all_passed = validate_migration(mysql_cfg, pg_cfg)
+        all_passed = validate_migration(mysql_cfg, pg_cfg, mysql_cfg.database)
     except Exception as e:
         console.print(f"\n  [red]✗ Validation error: {e}[/red]")
         console.print("  [dim]You can still validate manually with the SQL scripts in scripts/[/dim]")
@@ -1828,7 +1883,7 @@ def main():
     console.print("[bold yellow][5/6][/bold yellow] Schema diff report...")
 
     try:
-        schema_diff_report(mysql_cfg, pg_cfg)
+        schema_diff_report(mysql_cfg, pg_cfg, mysql_cfg.database)
     except Exception as e:
         console.print(f"\n  [red]✗ Schema diff error: {e}[/red]")
 
