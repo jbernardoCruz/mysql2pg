@@ -1357,10 +1357,18 @@ def run_pgloader_with_progress(client: docker.DockerClient, mysql_cfg: MySQLConf
                 "    • Check that pgloader/ directory exists\n"
             )
 
-        log_tail = logs[-2000:] if len(logs) > 2000 else logs
+        # Save full log to file for debugging
+        log_file = SCRIPT_DIR / "pgloader" / "pgloader_error.log"
+        try:
+            log_file.write_text(logs)
+            console.print(f"\n  [dim]Full pgloader log saved to: {log_file}[/dim]")
+        except OSError:
+            pass
+
+        log_tail = logs[-4000:] if len(logs) > 4000 else logs
         if log_tail.strip():
             console.print("\n  [bold]Last pgloader output:[/bold]")
-            for log_line in log_tail.strip().split("\n")[-20:]:
+            for log_line in log_tail.strip().split("\n")[-50:]:
                 console.print(f"  [dim]{log_line}[/dim]")
 
         try:
