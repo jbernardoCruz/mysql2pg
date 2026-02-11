@@ -19,7 +19,8 @@ SET
   work_mem to '48MB'
 
 CAST
-  type tinyint to boolean drop typemod,
+  type tinyint to smallint drop typemod,
+  type smallint when unsigned to integer drop typemod,
   type bit to boolean drop typemod,
   type int when unsigned to bigint drop typemod,
   type bigint when unsigned to numeric drop typemod,

@@ -155,8 +155,9 @@ The tool automatically handles these MySQL → PostgreSQL type conversions:
 
 | MySQL Type | PostgreSQL Type | Notes |
 |---|---|---|
-| `TINYINT(1)` | `BOOLEAN` | MySQL boolean emulation |
-| `TINYINT` | `BOOLEAN` | All tinyint mapped to boolean |
+| `TINYINT(1)` | `SMALLINT` | Preserves all data; convert to boolean post-migration if needed |
+| `TINYINT` | `SMALLINT` | Safe mapping for all tinyint values |
+| `SMALLINT UNSIGNED` | `INTEGER` | Unsigned → wider signed |
 | `BIT(1)` | `BOOLEAN` | — |
 | `INT UNSIGNED` | `BIGINT` | Unsigned → wider signed |
 | `BIGINT UNSIGNED` | `NUMERIC` | No PG unsigned equivalent |
@@ -168,8 +169,11 @@ The tool automatically handles these MySQL → PostgreSQL type conversions:
 | `AUTO_INCREMENT` | `SERIAL` / `BIGSERIAL` | Sequences auto-created |
 
 > **Note:** pgloader 3.6.7 does not support conditional CAST predicates (`when (= precision N)`),
-> so all `TINYINT` columns are cast to `BOOLEAN`. If your schema uses `TINYINT` for non-boolean
-> values, consider a post-migration `ALTER TABLE` to fix affected columns.
+> so all `TINYINT` columns are mapped to `SMALLINT` to safely preserve all data.
+> If you need `BOOLEAN` columns, convert them post-migration:
+> ```sql
+> ALTER TABLE foo ALTER COLUMN is_active TYPE boolean USING is_active::boolean;
+> ```
 
 ---
 
