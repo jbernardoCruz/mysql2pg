@@ -19,30 +19,15 @@ SET
   work_mem to '48MB'
 
 CAST
-  type tinyint to boolean using tinyint-to-boolean
-       when (= precision 1),
-
-  type tinyint to smallint
-       when (<> precision 1),
-
-  type bit to boolean
-       when (= precision 1),
-
+  type tinyint to boolean using tinyint-to-boolean,
+  type bit to boolean,
   type int when unsigned to bigint drop typemod,
   type bigint when unsigned to numeric drop typemod,
-
-  type datetime to timestamptz
-       drop default drop not null
-       using zero-dates-to-null,
-
-  type date
-       drop default drop not null
-       using zero-dates-to-null,
-
+  type datetime to timestamptz drop default drop not null using zero-dates-to-null,
+  type date drop default drop not null using zero-dates-to-null,
   type year to integer drop typemod,
-
   type enum to text drop typemod,
-  type set  to text drop typemod
+  type set to text drop typemod
 
 ALTER SCHEMA '{mysql_database}' RENAME TO 'public'
 ;
