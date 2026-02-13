@@ -1128,7 +1128,6 @@ def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
         converted_types = {
             "bool": "TINYINT/BIT → boolean",
             "timestamp": "DATETIME → timestamp",
-            "int2": "TINYINT → smallint",
             "int8": "INT UNSIGNED → bigint",
             "numeric": "BIGINT UNSIGNED → numeric",
         }
@@ -1560,7 +1559,7 @@ def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
                 "int": {"int4", "int8", "integer"},
                 "bigint": {"int8", "bigint", "numeric"},
                 "smallint": {"int2", "smallint"},
-                "tinyint": {"int2", "bool", "smallint"},
+                "tinyint": {"bool", "boolean"},
                 "varchar": {"varchar", "text"},
                 "char": {"bpchar", "char"},
                 "text": {"text"},

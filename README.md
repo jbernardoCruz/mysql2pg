@@ -155,25 +155,21 @@ The tool automatically handles these MySQL → PostgreSQL type conversions:
 
 | MySQL Type | PostgreSQL Type | Notes |
 |---|---|---|
-| `TINYINT(1)` | `SMALLINT` | Preserves all data; convert to boolean post-migration if needed |
-| `TINYINT` | `SMALLINT` | Safe mapping for all tinyint values |
+| `TINYINT(1)` | `BOOLEAN` | `0` → `false`, non-zero → `true` |
+| `TINYINT` | `BOOLEAN` | `0` → `false`, non-zero → `true` |
 | `SMALLINT UNSIGNED` | `INTEGER` | Unsigned → wider signed |
 | `BIT(1)` | `BOOLEAN` | — |
 | `INT UNSIGNED` | `BIGINT` | Unsigned → wider signed |
 | `BIGINT UNSIGNED` | `NUMERIC` | No PG unsigned equivalent |
-| `DATETIME` | `TIMESTAMPTZ` | Zero-dates → `NULL` |
+| `DATETIME` | `TIMESTAMP` | Zero-dates → `NULL`, no timezone conversion |
 | `DATE` | `DATE` | Zero-dates → `NULL` |
 | `YEAR` | `INTEGER` | No PG year type |
 | `ENUM(...)` | `TEXT` | Optionally add CHECK constraints |
 | `SET(...)` | `TEXT` | No PG equivalent |
 | `AUTO_INCREMENT` | `SERIAL` / `BIGSERIAL` | Sequences auto-created |
 
-> **Note:** pgloader 3.6.7 does not support conditional CAST predicates (`when (= precision N)`),
-> so all `TINYINT` columns are mapped to `SMALLINT` to safely preserve all data.
-> If you need `BOOLEAN` columns, convert them post-migration:
-> ```sql
-> ALTER TABLE foo ALTER COLUMN is_active TYPE boolean USING is_active::boolean;
-> ```
+> **Note:** pgloader 3.6.7 does not support conditional CAST predicates (`when (= precision N)`).
+> The `drop typemod` flag is used to prevent `boolean(1)` syntax errors in PostgreSQL.
 
 ---
 
