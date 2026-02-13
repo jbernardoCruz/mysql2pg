@@ -186,7 +186,7 @@ The tool automatically validates after migration:
 | **Row counts** | Exact comparison MySQL vs PostgreSQL per table |
 | **Schema discovery** | Auto-detects target schema (handles `public` or database-named schemas) |
 | **Boolean types** | Verifies `TINYINT` → `boolean` |
-| **Timestamp types** | Verifies `DATETIME` → `timestamptz` |
+| **Timestamp types** | Verifies `DATETIME` → `timestamp` |
 | **Unsigned ints** | Verifies `INT UNSIGNED` → `bigint` |
 | **Primary keys** | Confirms PKs exist on all tables |
 | **Foreign keys** | Confirms FK constraints migrated |

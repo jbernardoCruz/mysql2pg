@@ -1127,7 +1127,7 @@ def validate_migration(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
     if columns is not None:
         converted_types = {
             "bool": "TINYINT/BIT → boolean",
-            "timestamptz": "DATETIME → timestamptz",
+            "timestamp": "DATETIME → timestamp",
             "int2": "TINYINT → smallint",
             "int8": "INT UNSIGNED → bigint",
             "numeric": "BIGINT UNSIGNED → numeric",
@@ -1566,7 +1566,7 @@ def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
                 "text": {"text"},
                 "longtext": {"text"},
                 "mediumtext": {"text"},
-                "datetime": {"timestamp", "timestamptz"},
+                "datetime": {"timestamp"},
                 "timestamp": {"timestamp", "timestamptz"},
                 "date": {"date"},
                 "time": {"time", "timetz"},
