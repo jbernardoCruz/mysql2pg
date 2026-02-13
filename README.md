@@ -263,6 +263,53 @@ npm run test:connection
 
 ---
 
+## 🐳 Docker Container Management
+
+After migration, the PostgreSQL container (`pg-target`) keeps running so your data stays available.
+
+### Common Commands
+
+```bash
+# Check status
+docker ps | grep pg-target
+
+# Stop (data is preserved)
+docker stop pg-target
+
+# Start again later
+docker start pg-target
+
+# Connect to PostgreSQL
+docker exec -it pg-target psql -U postgres -d your_database
+
+# View logs
+docker logs pg-target
+
+# ⚠️ Remove container AND data (destructive)
+docker rm -f pg-target
+docker volume rm pg_data
+```
+
+### Data Persistence
+
+| Action | Data Survives? |
+|---|---|
+| `docker stop pg-target` | ✅ Yes |
+| `docker start pg-target` | ✅ Yes |
+| System reboot | ✅ Yes — just `docker start pg-target` |
+| `docker rm pg-target` | ✅ Yes — volume still exists |
+| `docker volume rm pg_data` | ❌ **No** — data is gone |
+
+### Typical Workflow
+
+1. **Migrate:** `python migrate.py` — starts container + migrates
+2. **Use:** Connect your app to `localhost:5432`
+3. **Pause:** `docker stop pg-target` (saves resources)
+4. **Resume:** `docker start pg-target` — everything is still there
+5. **Re-migrate:** The tool drops and recreates tables automatically
+
+---
+
 ## 🛠 Troubleshooting
 
 <details>
