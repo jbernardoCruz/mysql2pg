@@ -16,9 +16,6 @@ __pycache__/
 venv/
 .venv/
 
-# Prisma
-prisma/migrations/**/migration_lock.toml
-
 # IDE
 .vscode/
 .idea/
