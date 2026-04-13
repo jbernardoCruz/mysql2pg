@@ -40,5 +40,6 @@ DEFAULT_CONFIG = {
         "user": "postgres",
         "database": "myapp",
         "password": "postgres",
+        "schema": "legacy",
     },
 }

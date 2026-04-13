@@ -76,7 +76,8 @@ def dry_run(mysql_cfg, pg_cfg):
     console.print(
         Panel(
             f"[bold]Source:[/bold]  mysql://{mysql_cfg.user}:****@{mysql_cfg.host}:{mysql_cfg.port}/{mysql_cfg.database}\n"
-            f"[bold]Target:[/bold]  postgresql://{pg_cfg.user}:****@localhost:{pg_cfg.port}/{pg_cfg.database}",
+            f"[bold]Target:[/bold]  postgresql://{pg_cfg.user}:****@localhost:{pg_cfg.port}/{pg_cfg.database}\n"
+            f"[bold]Schema:[/bold]  {pg_cfg.schema}",
             border_style="dim",
         )
     )
@@ -256,7 +257,8 @@ def main():
     console.print(
         Panel(
             f"[bold]Source:[/bold]  mysql://{mysql_cfg.user}:****@{mysql_cfg.host}:{mysql_cfg.port}/{mysql_cfg.database}\n"
-            f"[bold]Target:[/bold]  postgresql://{pg_cfg.user}:****@localhost:{pg_cfg.port}/{pg_cfg.database}",
+            f"[bold]Target:[/bold]  postgresql://{pg_cfg.user}:****@localhost:{pg_cfg.port}/{pg_cfg.database}\n"
+            f"[bold]Schema:[/bold]  {pg_cfg.schema}",
             title="Migration Summary",
             border_style="yellow",
         )

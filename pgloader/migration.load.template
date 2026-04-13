@@ -30,5 +30,5 @@ CAST
   type enum to text drop typemod,
   type set to text drop typemod
 
-ALTER SCHEMA '{mysql_database}' RENAME TO 'public'
+ALTER SCHEMA '{mysql_database}' RENAME TO '{target_schema}'
 ;

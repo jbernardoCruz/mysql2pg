@@ -56,6 +56,7 @@ def generate_pgloader_config(mysql: MySQLConfig, pg: PGConfig) -> tuple[str, str
         # Format non-URI parts (like the database name for ALTER SCHEMA)
         config = template.format(
             mysql_database=mysql.database,
+            target_schema=pg.schema,
         )
         
         # Replace URI markers with actual percent-encoded URIs

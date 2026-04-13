@@ -112,7 +112,8 @@ python migrate.py --init
     "port": 5432,
     "user": "postgres",
     "database": "myapp",
-    "password": "postgres"
+    "password": "postgres",
+    "schema": "legacy"
   }
 }
 ```
@@ -256,10 +257,13 @@ docker exec -it pg-target psql -U postgres -d myapp
 | `postgresql.user` | `postgres` | PostgreSQL username |
 | `postgresql.database` | `myapp` | PostgreSQL database name |
 | `postgresql.password` | `postgres` | PostgreSQL password |
+| `postgresql.schema` | `legacy` | Target schema name in PostgreSQL |
 
 > ⚠️ **Security:** `migration_config.json` is in `.gitignore` — your credentials are never committed.
 >
 > **Remote PostgreSQL:** If you set `postgresql.host` to anything other than `localhost` or `127.0.0.1`, the tool will **skip starting the PostgreSQL container** and attempt to connect to your remote server directly.
+>
+> **Schema naming:** By default, tables are placed in the `legacy` schema (not `public`). This separates migrated data from new PostgreSQL-native tables. Prisma supports this via the `schemas` property in `datasource`.
 
 ---
 
