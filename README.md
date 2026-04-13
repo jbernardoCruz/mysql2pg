@@ -9,6 +9,7 @@ Built with [pgloader](https://pgloader.io/) for data migration, [Docker](https:/
 ## ✨ Features
 
 - **One-command migration** — `python migrate.py` handles everything
+- **Prisma compatibility** — `python migrate.py --prisma-compat` converts naming to snake_case and creates native PostgreSQL ENUMs
 - **Dry-run mode** — `python migrate.py --dry-run` validates config, tests connections, previews tables — without migrating
 - **Progress bar** — Live per-table progress during pgloader migration
 - **Schema diff report** — Side-by-side MySQL vs PostgreSQL type comparison after migration
@@ -34,32 +35,39 @@ Built with [pgloader](https://pgloader.io/) for data migration, [Docker](https:/
 
   ✓ Config loaded from migration_config.json
 
-[1/6] Starting PostgreSQL container...         ✓
-[2/6] Generating pgloader configuration...     ✓
-[3/6] Running pgloader migration...
+[1/7] Starting PostgreSQL container...         ✓
+[2/7] Generating pgloader configuration...     ✓
+[3/7] Running pgloader migration...
 
   ⠋ Migrating 8 tables (104,783 rows)...  ████████████▌     50%  0:00:12
   ⠋ Migrated orders (5/8)...
 
-[4/6] Validating migration...
+[4/7] Prisma compatibility transforms...
+  ✓ Renamed 3 tables to snake_case
+  ✓ Renamed 12 columns to snake_case
+  ✓ Created 2 native ENUM types
+
+[5/7] Validating migration...
 
   Row Count Comparison
-  ╭──────────────┬─────────┬──────────┬────────╮
-  │ Table        │ MySQL   │ Postgres │ Status │
-  ├──────────────┼─────────┼──────────┼────────┤
-  │ users        │ 12,450  │ 12,450   │ ✓ OK   │
-  │ orders       │ 89,231  │ 89,231   │ ✓ OK   │
-  │ products     │ 3,102   │ 3,102    │ ✓ OK   │
-  ╰──────────────┴─────────┴──────────┴────────╯
+  ╭──────────────────┬─────────┬──────────┬────────╮
+  │ Table            │ MySQL   │ Postgres │ Status │
+  ├──────────────────┼─────────┼──────────┼────────┤
+  │ user_accounts    │ 12,450  │ 12,450   │ ✓ OK   │
+  │ orders           │ 89,231  │ 89,231   │ ✓ OK   │
+  │ products         │ 3,102   │ 3,102    │ ✓ OK   │
+  ╰──────────────────┴─────────┴──────────┴────────╯
 
-[5/6] Schema diff report...
-[6/6] Migration summary
+[6/7] Schema diff report...
+[7/7] Migration summary
 
 ╭──────────────────────────────────────────────────────╮
 │  ✓ Migration completed successfully!                 │
 │  All row counts match and types are correctly mapped │
 ╰──────────────────────────────────────────────────────╯
 ```
+
+> **Note:** The preview above shows the output with `--prisma-compat`. Without the flag, the pipeline has 6 steps and skips Prisma transforms.
 
 ---
 
@@ -125,6 +133,24 @@ python migrate.py
 
 That's it. The tool will start PostgreSQL in Docker, run pgloader with a progress bar, migrate your data, validate the results, and show a schema diff report.
 
+### 7. Prisma compatibility (optional)
+
+If you're using [Prisma ORM](https://www.prisma.io/) with the migrated database, add the `--prisma-compat` flag:
+
+```bash
+python migrate.py --prisma-compat
+```
+
+This applies post-migration transforms to ensure full Prisma compatibility:
+- **snake_case naming** — Renames tables and columns from `camelCase`/`PascalCase` to `snake_case` (e.g. `UserAccounts` → `user_accounts`, `firstName` → `first_name`)
+- **Native ENUM types** — Converts pgloader's `ENUM→TEXT` to native PostgreSQL ENUM types, which Prisma introspects as `enum` blocks
+
+After migration with `--prisma-compat`, running `prisma db pull` will generate a clean schema with:
+- Models in PascalCase (Prisma infers from snake_case tables)
+- Fields in camelCase (Prisma infers from snake_case columns)
+- Proper `@@map()` and `@map()` attributes
+- Native enum definitions
+
 ---
 
 ## 📁 Project Structure
@@ -140,13 +166,18 @@ mysql2pg/
 │   ├── validation.py               # Row counts, types, constraints
 │   ├── schema_diff.py              # Schema capture, diff report
 │   ├── reporting.py                # HTML report generation
-│   └── cli.py                      # CLI args, dry-run, main pipeline
+│   ├── cli.py                      # CLI args, dry-run, main pipeline
+│   ├── naming.py                   # camelCase → snake_case conversion (Prisma)
+│   ├── enums.py                    # MySQL ENUM → native PG ENUM (Prisma)
+│   └── post_migration.py           # Post-migration transforms (Prisma)
 ├── migration_config.json           # Connection credentials (gitignored)
 ├── requirements.txt                # Python dependencies
 ├── README.md                       # ← You are here
 ├── LICENSE                         # MIT License
 ├── pgloader/
 │   └── migration.load.template     # pgloader config template
+├── tests/
+│   └── test_naming.py              # Unit tests for naming conventions
 └── scripts/
     ├── validate.sql                # Manual row count queries (psql)
     └── validate_types.sql          # Manual column type queries (psql)
@@ -169,12 +200,15 @@ The tool automatically handles these MySQL → PostgreSQL type conversions:
 | `DATETIME` | `TIMESTAMP` | Zero-dates → `NULL`, no timezone conversion |
 | `DATE` | `DATE` | Zero-dates → `NULL` |
 | `YEAR` | `INTEGER` | No PG year type |
-| `ENUM(...)` | `TEXT` | Optionally add CHECK constraints |
+| `ENUM(...)` | `TEXT` | Default: mapped to TEXT |
+| `ENUM(...)` | Native `ENUM` | With `--prisma-compat`: creates native PG ENUM type |
 | `SET(...)` | `TEXT` | No PG equivalent |
 | `AUTO_INCREMENT` | `SERIAL` / `BIGSERIAL` | Sequences auto-created |
 
 > **Note:** pgloader 3.6.7 does not support conditional CAST predicates (`when (= precision N)`).
 > The `drop typemod` flag is used to prevent `boolean(1)` syntax errors in PostgreSQL.
+>
+> **Prisma ENUMs:** With `--prisma-compat`, native ENUM type names follow the `{table}_{column}` convention (e.g. `users_status`). This ensures Prisma introspects them correctly as `enum` blocks.
 
 ---
 
@@ -399,3 +433,4 @@ Contributions are welcome! Here's how:
 - [x] ~~Progress bar during pgloader migration (parse log output)~~ — ✅ Implemented
 - [ ] macOS / Windows support
 - [x] ~~Schema diff report (before/after comparison)~~ — ✅ Implemented
+- [x] ~~Prisma ORM compatibility (snake_case naming + native ENUMs)~~ — ✅ Implemented (`--prisma-compat`)

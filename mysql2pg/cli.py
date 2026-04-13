@@ -23,6 +23,7 @@ from mysql2pg.pgloader import generate_pgloader_config, run_pgloader_with_progre
 from mysql2pg.validation import validate_migration, get_mysql_tables
 from mysql2pg.schema_diff import get_mysql_schema, schema_diff_report
 from mysql2pg.reporting import generate_html_report
+from mysql2pg.post_migration import run_post_migration
 
 
 def parse_args():
@@ -32,9 +33,10 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python migrate.py --init       Create config file template\n"
-            "  python migrate.py --dry-run    Validate without migrating\n"
-            "  python migrate.py              Run full migration\n"
+            "  python migrate.py --init            Create config file template\n"
+            "  python migrate.py --dry-run         Validate without migrating\n"
+            "  python migrate.py                   Run full migration\n"
+            "  python migrate.py --prisma-compat   Run migration + Prisma transforms\n"
         ),
     )
     parser.add_argument(
@@ -48,6 +50,11 @@ def parse_args():
         help="Validate config, test connections, preview schema — no migration",
     )
     parser.add_argument("--verbose", action="store_true", help="Show full detailed tables in console")
+    parser.add_argument(
+        "--prisma-compat",
+        action="store_true",
+        help="Apply Prisma compatibility transforms: snake_case naming + native ENUMs",
+    )
     return parser.parse_args()
 
 
@@ -261,11 +268,14 @@ def main():
 
     console.print("")
 
+    # Determine total steps based on flags
+    total_steps = 7 if args.prisma_compat else 6
+
     # ── Step 2: Start PostgreSQL (if local) ───────────────────
     client = get_docker_client()
 
     if pg_cfg.host in ("localhost", "127.0.0.1"):
-        console.print("[bold yellow][1/6][/bold yellow] Starting PostgreSQL container...")
+        console.print(f"[bold yellow][1/{total_steps}][/bold yellow] Starting PostgreSQL container...")
         start_postgres(client, pg_cfg)
 
         with Progress(
@@ -283,16 +293,16 @@ def main():
 
         console.print("  [green]✓[/green] PostgreSQL is ready\n")
     else:
-        console.print(f"[bold yellow][1/6][/bold yellow] Using remote PostgreSQL at [cyan]{pg_cfg.host}[/cyan]")
+        console.print(f"[bold yellow][1/{total_steps}][/bold yellow] Using remote PostgreSQL at [cyan]{pg_cfg.host}[/cyan]")
         console.print("  [dim]Skipping container startup.[/dim]\n")
 
     # ── Step 3: Generate pgloader config ──────────────────────
-    console.print("[bold yellow][2/6][/bold yellow] Generating pgloader configuration...")
+    console.print(f"[bold yellow][2/{total_steps}][/bold yellow] Generating pgloader configuration...")
     source_uri, target_uri = generate_pgloader_config(mysql_cfg, pg_cfg)
     console.print("")
 
     # ── Step 4: Run pgloader ──────────────────────────────────
-    console.print("[bold yellow][3/6][/bold yellow] Running pgloader migration...")
+    console.print(f"[bold yellow][3/{total_steps}][/bold yellow] Running pgloader migration...")
     console.print("  [dim]This may take a while depending on database size.[/dim]\n")
 
     success = run_pgloader_with_progress(client, mysql_cfg, source_uri, target_uri)
@@ -302,8 +312,27 @@ def main():
 
     console.print("\n  [green]✓[/green] pgloader migration complete\n")
 
+    # ── Step 4.5: Prisma compatibility transforms (optional) ──
+    prisma_report = None
+    if args.prisma_compat:
+        console.print(f"[bold yellow][4/{total_steps}][/bold yellow] Prisma compatibility transforms...")
+        try:
+            prisma_report = run_post_migration(mysql_cfg, pg_cfg, mysql_cfg.database)
+            if prisma_report["errors"]:
+                console.print(
+                    f"  [yellow]⚠ Completed with {len(prisma_report['errors'])} warnings[/yellow]"
+                )
+            else:
+                console.print("  [green]✓[/green] Prisma transforms complete")
+        except Exception as e:
+            console.print(f"\n  [red]✗ Prisma transforms failed: {e}[/red]")
+            console.print("  [dim]Migration data is intact — only naming/ENUM changes failed.[/dim]")
+            prisma_report = {"errors": [str(e)]}
+        console.print("")
+
     # ── Step 5: Validate ──────────────────────────────────────
-    console.print("[bold yellow][4/6][/bold yellow] Validating migration...")
+    step_validate = 5 if args.prisma_compat else 4
+    console.print(f"[bold yellow][{step_validate}/{total_steps}][/bold yellow] Validating migration...")
 
     try:
         report = validate_migration(mysql_cfg, pg_cfg, mysql_cfg.database, verbose=args.verbose)
@@ -315,7 +344,8 @@ def main():
         report = None
 
     # ── Step 6: Schema diff ───────────────────────────────────
-    console.print("[bold yellow][5/6][/bold yellow] Schema diff report...")
+    step_diff = 6 if args.prisma_compat else 5
+    console.print(f"[bold yellow][{step_diff}/{total_steps}][/bold yellow] Schema diff report...")
 
     try:
         diff_report = schema_diff_report(mysql_cfg, pg_cfg, mysql_cfg.database, verbose=args.verbose)
@@ -326,14 +356,18 @@ def main():
     # ── Step 7: HTML Report ───────────────────────────────────
     if report and diff_report:
         try:
-            html_path = generate_html_report(report, diff_report, mysql_cfg.database, pg_cfg.database)
+            html_path = generate_html_report(
+                report, diff_report, mysql_cfg.database, pg_cfg.database,
+                prisma_report=prisma_report,
+            )
             console.print(f"  [green]✓[/green] Detailed report generated: [cyan]{html_path}[/cyan]")
         except Exception as e:
             console.print(f"  [red]✗ HTML report error: {e}[/red]")
 
     # ── Summary ───────────────────────────────────────────────
     console.print("")
-    console.print("[bold yellow][6/6][/bold yellow] Migration summary")
+    step_summary = 7 if args.prisma_compat else 6
+    console.print(f"[bold yellow][{step_summary}/{total_steps}][/bold yellow] Migration summary")
 
     if all_passed:
         console.print(

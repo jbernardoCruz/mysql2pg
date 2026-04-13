@@ -3,7 +3,7 @@ HTML migration report generation.
 """
 
 
-def generate_html_report(validation: dict, diff: dict, mysql_db: str, pg_db: str):
+def generate_html_report(validation: dict, diff: dict, mysql_db: str, pg_db: str, prisma_report: dict = None):
     """Generate a detailed HTML migration report."""
     html_file = "migration_report.html"
     
@@ -128,7 +128,66 @@ def generate_html_report(validation: dict, diff: dict, mysql_db: str, pg_db: str
             </tbody>
         </table>
     </div>
+    """
 
+    # ── Prisma Compatibility section (optional) ───────────────
+    if prisma_report and (prisma_report.get("tables_renamed") or prisma_report.get("columns_renamed") or prisma_report.get("enums_created")):
+        html += """
+    <div class="card" style="border-left: 4px solid #805ad5;">
+        <h3>🔮 Prisma Compatibility Transforms</h3>
+        """
+
+        # Tables renamed
+        rename_details = prisma_report.get("rename_details", {})
+        tables_renamed = rename_details.get("tables_renamed", []) if isinstance(rename_details, dict) else []
+        if tables_renamed:
+            html += """
+        <h4>Tables Renamed (snake_case)</h4>
+        <table>
+            <thead><tr><th>Original</th><th>New Name</th></tr></thead>
+            <tbody>
+            """
+            for t in tables_renamed:
+                html += f'<tr><td class="mysql-val">{t["from"]}</td><td class="pg-val">{t["to"]}</td></tr>'
+            html += "</tbody></table>"
+
+        # Columns renamed
+        columns_renamed = rename_details.get("columns_renamed", []) if isinstance(rename_details, dict) else []
+        if columns_renamed:
+            html += """
+        <h4>Columns Renamed (snake_case)</h4>
+        <table>
+            <thead><tr><th>Table</th><th>Original</th><th>New Name</th></tr></thead>
+            <tbody>
+            """
+            for c in columns_renamed:
+                html += f'<tr><td>{c["table"]}</td><td class="mysql-val">{c["from"]}</td><td class="pg-val">{c["to"]}</td></tr>'
+            html += "</tbody></table>"
+
+        # ENUMs created
+        enum_details = prisma_report.get("enum_details", [])
+        if enum_details:
+            html += """
+        <h4>Native PostgreSQL ENUMs Created</h4>
+        <table>
+            <thead><tr><th>ENUM Type</th><th>Table.Column</th><th>Values</th></tr></thead>
+            <tbody>
+            """
+            for e in enum_details:
+                values_str = ", ".join(e["values"])
+                html += f'<tr><td class="table-name">{e["type_name"]}</td><td>{e["table"]}.{e["column"]}</td><td><code>{values_str}</code></td></tr>'
+            html += "</tbody></table>"
+
+        # Errors
+        if prisma_report.get("errors"):
+            html += '<h4 style="color: #e53e3e;">Warnings</h4><ul style="color: #c53030;">'
+            for err in prisma_report["errors"]:
+                html += f"<li>{err}</li>"
+            html += "</ul>"
+
+        html += "</div>"
+
+    html += """
     <div class="card">
         <h3>Constraints &amp; Metadata</h3>
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 40px;">

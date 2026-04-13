@@ -141,7 +141,7 @@ def schema_diff_report(mysql_cfg: MySQLConfig, pg_cfg: PGConfig, mysql_database:
                 "longblob": {"bytea"},
                 "mediumblob": {"bytea"},
                 "bit": {"bool", "bit"},
-                "enum": {"text", "varchar"},
+                "enum": {"text", "varchar", "USER-DEFINED"},
                 "json": {"json", "jsonb"},
                 "boolean": {"bool"},
             }
