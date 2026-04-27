@@ -106,18 +106,16 @@ def run_post_migration(
     try:
         cursor = conn.cursor()
 
-        for stmt in all_sql:
+        for i, stmt in enumerate(all_sql):
             try:
+                cursor.execute(f"SAVEPOINT sp_{i}")
                 cursor.execute(stmt)
             except psycopg2.Error as e:
-                # Log the error but continue with remaining statements
+                # Log the error, rollback to savepoint, and continue
                 error_msg = f"SQL failed: {stmt[:80]}... → {e}"
                 report["errors"].append(error_msg)
                 console.print(f"  [yellow]⚠ {error_msg}[/yellow]")
-                # Rollback the failed statement and continue
-                conn.rollback()
-                # Re-enter transaction for next statement
-                cursor = conn.cursor()
+                cursor.execute(f"ROLLBACK TO SAVEPOINT sp_{i}")
 
         # Commit all successful changes
         conn.commit()

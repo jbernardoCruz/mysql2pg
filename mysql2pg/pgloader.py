@@ -14,7 +14,7 @@ from rich.progress import (
 
 from mysql2pg import (
     console, SCRIPT_DIR, PGLOADER_TEMPLATE, PGLOADER_OUTPUT,
-    DOCKER_NETWORK, PG_CONTAINER_NAME, PGLOADER_IMAGE,
+    DOCKER_NETWORK, PGLOADER_IMAGE,
 )
 from mysql2pg.config import MySQLConfig, PGConfig
 from mysql2pg.docker_utils import ensure_network
@@ -48,7 +48,7 @@ def generate_pgloader_config(mysql: MySQLConfig, pg: PGConfig) -> tuple[str, str
 
     # Construct URIs for environment variables
     source_uri = f"mysql://{mysql_user_encoded}:{mysql_pw_encoded}@{mysql.docker_host}:{mysql.port}/{mysql_db_encoded}"
-    target_host = PG_CONTAINER_NAME if pg.host in ("localhost", "127.0.0.1") else pg.host
+    target_host = pg.container_name if pg.host in ("localhost", "127.0.0.1") else pg.host
     target_port = 5432 if pg.host in ("localhost", "127.0.0.1") else pg.port
     target_uri = f"postgresql://{pg_user_encoded}:{pg_pw_encoded}@{target_host}:{target_port}/{pg_db_encoded}"
 

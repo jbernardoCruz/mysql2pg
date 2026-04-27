@@ -121,7 +121,7 @@ def generate_enum_type_name(table_name: str, column_name: str) -> str:
 
 def generate_enum_sql(
     mysql_enums: list[dict],
-    schema: str = "public",
+    schema: str = "legacy",
     use_snake_case: bool = True,
 ) -> tuple[list[str], list[dict]]:
     """Generate SQL to create native PostgreSQL ENUMs and alter columns.

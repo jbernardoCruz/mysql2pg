@@ -33,13 +33,14 @@ class MySQLConfig:
 
 
 class PGConfig:
-    def __init__(self, host: str, port: int, user: str, database: str, password: str, schema: str = "legacy"):
+    def __init__(self, host: str, port: int, user: str, database: str, password: str, schema: str = "legacy", container_name: str = "pg-target"):
         self.host = host
         self.port = port
         self.user = user
         self.password = password
         self.database = database
         self.schema = schema
+        self.container_name = container_name
 
 
 # ═════════════════════════════════════════════════════════════
@@ -204,6 +205,7 @@ def load_config() -> tuple[MySQLConfig, PGConfig]:
         database=str(pg["database"]).strip(),
         password=str(pg["password"]),
         schema=str(pg.get("schema", "legacy")).strip(),
+        container_name=str(pg.get("container_name", "pg-target")).strip(),
     )
 
     return mysql_cfg, pg_cfg

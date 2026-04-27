@@ -113,7 +113,8 @@ python migrate.py --init
     "user": "postgres",
     "database": "myapp",
     "password": "postgres",
-    "schema": "legacy"
+    "schema": "legacy",
+    "container_name": "pg-target"
   }
 }
 ```
@@ -220,7 +221,7 @@ The tool automatically validates after migration:
 | Check | Details |
 |---|---|
 | **Row counts** | Exact comparison MySQL vs PostgreSQL per table |
-| **Schema discovery** | Auto-detects target schema (handles `public` or database-named schemas) |
+| **Schema discovery** | Auto-detects target schema (handles `legacy`, `public`, or database-named schemas) |
 | **Boolean types** | Verifies `TINYINT` → `boolean` |
 | **Timestamp types** | Verifies `DATETIME` → `timestamp` |
 | **Unsigned ints** | Verifies `INT UNSIGNED` → `bigint` |
@@ -232,7 +233,8 @@ The tool automatically validates after migration:
 For manual inspection via psql:
 
 ```bash
-docker exec -it pg-target psql -U postgres -d myapp
+# Replace <container_name> with your configured container name (default: pg-target)
+docker exec -it <container_name> psql -U postgres -d myapp
 
 # Inside psql:
 \i scripts/validate.sql
@@ -258,6 +260,7 @@ docker exec -it pg-target psql -U postgres -d myapp
 | `postgresql.database` | `myapp` | PostgreSQL database name |
 | `postgresql.password` | `postgres` | PostgreSQL password |
 | `postgresql.schema` | `legacy` | Target schema name in PostgreSQL |
+| `postgresql.container_name` | `pg-target` | Name of the Docker container for PostgreSQL |
 
 > ⚠️ **Security:** `migration_config.json` is in `.gitignore` — your credentials are never committed.
 >
@@ -291,47 +294,49 @@ sudo systemctl restart mysql
 
 ## 🐳 Docker Container Management
 
-After migration, the PostgreSQL container (`pg-target`) keeps running so your data stays available.
+After migration, the PostgreSQL container (default: `pg-target`, configurable via `postgresql.container_name`) keeps running so your data stays available.
 
 ### Common Commands
 
 ```bash
+# Replace <container_name> with your configured name (default: pg-target)
+
 # Check status
-docker ps | grep pg-target
+docker ps | grep <container_name>
 
 # Stop (data is preserved)
-docker stop pg-target
+docker stop <container_name>
 
 # Start again later
-docker start pg-target
+docker start <container_name>
 
 # Connect to PostgreSQL
-docker exec -it pg-target psql -U postgres -d your_database
+docker exec -it <container_name> psql -U postgres -d your_database
 
 # View logs
-docker logs pg-target
+docker logs <container_name>
 
 # ⚠️ Remove container AND data (destructive)
-docker rm -f pg-target
-docker volume rm pg_data
+docker rm -f <container_name>
+docker volume rm sql_pgdata
 ```
 
 ### Data Persistence
 
 | Action | Data Survives? |
 |---|---|
-| `docker stop pg-target` | ✅ Yes |
-| `docker start pg-target` | ✅ Yes |
-| System reboot | ✅ Yes — just `docker start pg-target` |
-| `docker rm pg-target` | ✅ Yes — volume still exists |
-| `docker volume rm pg_data` | ❌ **No** — data is gone |
+| `docker stop <container>` | ✅ Yes |
+| `docker start <container>` | ✅ Yes |
+| System reboot | ✅ Yes — just `docker start <container>` |
+| `docker rm <container>` | ✅ Yes — volume still exists |
+| `docker volume rm sql_pgdata` | ❌ **No** — data is gone |
 
 ### Typical Workflow
 
 1. **Migrate:** `python migrate.py` — starts container + migrates
 2. **Use:** Connect your app to `localhost:5432`
-3. **Pause:** `docker stop pg-target` (saves resources)
-4. **Resume:** `docker start pg-target` — everything is still there
+3. **Pause:** `docker stop <container_name>` (saves resources)
+4. **Resume:** `docker start <container_name>` — everything is still there
 5. **Re-migrate:** The tool drops and recreates tables automatically
 
 ---

@@ -286,7 +286,7 @@ def main():
             console=console,
         ) as progress:
             task = progress.add_task("[cyan]Waiting for PostgreSQL to be healthy...", total=1)
-            healthy = wait_for_postgres(client)
+            healthy = wait_for_postgres(client, container_name=pg_cfg.container_name)
             progress.update(task, completed=1)
 
         if not healthy:

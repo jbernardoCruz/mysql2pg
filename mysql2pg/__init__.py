@@ -22,7 +22,6 @@ CONFIG_FILE = SCRIPT_DIR / "migration_config.json"
 PGLOADER_TEMPLATE = SCRIPT_DIR / "pgloader" / "migration.load.template"
 PGLOADER_OUTPUT = SCRIPT_DIR / "pgloader" / "migration.load"
 DOCKER_NETWORK = "sql_default"
-PG_CONTAINER_NAME = "pg-target"
 PG_IMAGE = "postgres:16-alpine"
 PGLOADER_IMAGE = "dimitri/pgloader:latest"
 
@@ -41,5 +40,6 @@ DEFAULT_CONFIG = {
         "database": "myapp",
         "password": "postgres",
         "schema": "legacy",
+        "container_name": "pg-target",
     },
 }

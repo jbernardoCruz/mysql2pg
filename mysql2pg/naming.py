@@ -127,7 +127,7 @@ def get_mysql_original_names(config: MySQLConfig) -> dict:
 # SQL generation for renames
 # ═════════════════════════════════════════════════════════════
 
-def generate_rename_sql(mysql_cfg: MySQLConfig, schema: str = "public") -> tuple[list[str], dict]:
+def generate_rename_sql(mysql_cfg: MySQLConfig, schema: str = "legacy") -> tuple[list[str], dict]:
     """Generate ALTER TABLE/COLUMN RENAME statements for snake_case conversion.
 
     Uses the original MySQL names as source of truth, applies camel_to_snake(),

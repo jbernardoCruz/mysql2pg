@@ -10,7 +10,7 @@ from docker.errors import DockerException, NotFound, APIError
 
 from mysql2pg import (
     console, CONFIG_FILE,
-    DOCKER_NETWORK, PG_CONTAINER_NAME, PG_IMAGE,
+    DOCKER_NETWORK, PG_IMAGE,
 )
 from mysql2pg.config import PGConfig
 
@@ -48,9 +48,10 @@ def ensure_network(client: docker.DockerClient, name: str):
 
 def start_postgres(client: docker.DockerClient, pg: PGConfig) -> docker.models.containers.Container:
     """Start PostgreSQL container, or reuse if already running."""
+    container_name = pg.container_name
 
     # Remove legacy container name if exists (fixes pgloader underscore issue)
-    if PG_CONTAINER_NAME != "pg_target":
+    if container_name != "pg_target":
         try:
             legacy = client.containers.get("pg_target")
             console.print("  [dim]Removing legacy container 'pg_target'...[/dim]")
@@ -62,18 +63,18 @@ def start_postgres(client: docker.DockerClient, pg: PGConfig) -> docker.models.c
 
     # Check if container already exists
     try:
-        container = client.containers.get(PG_CONTAINER_NAME)
+        container = client.containers.get(container_name)
         if container.status == "running":
             console.print("  [green]✓[/green] PostgreSQL container already running")
             return container
         else:
-            console.print(f"  [dim]Removing stopped container '{PG_CONTAINER_NAME}'...[/dim]")
+            console.print(f"  [dim]Removing stopped container '{container_name}'...[/dim]")
             try:
                 container.remove(force=True)
             except APIError as e:
                 console.print(
-                    f"\n[red]✗ Cannot remove old container '{PG_CONTAINER_NAME}':[/red] {e}\n"
-                    f"  [dim]Try manually: docker rm -f {PG_CONTAINER_NAME}[/dim]\n"
+                    f"\n[red]✗ Cannot remove old container '{container_name}':[/red] {e}\n"
+                    f"  [dim]Try manually: docker rm -f {container_name}[/dim]\n"
                 )
                 sys.exit(1)
     except NotFound:
@@ -103,7 +104,7 @@ def start_postgres(client: docker.DockerClient, pg: PGConfig) -> docker.models.c
     try:
         container = client.containers.run(
             PG_IMAGE,
-            name=PG_CONTAINER_NAME,
+            name=container_name,
             detach=True,
             ports={"5432/tcp": pg.port},
             environment={
@@ -133,25 +134,25 @@ def start_postgres(client: docker.DockerClient, pg: PGConfig) -> docker.models.c
             )
         elif "Conflict" in error_msg:
             console.print(
-                f"\n[red]✗ Container name '{PG_CONTAINER_NAME}' conflict:[/red] {e}\n"
-                f"  [dim]Try: docker rm -f {PG_CONTAINER_NAME}[/dim]\n"
+                f"\n[red]✗ Container name '{container_name}' conflict:[/red] {e}\n"
+                f"  [dim]Try: docker rm -f {container_name}[/dim]\n"
             )
         else:
             console.print(
                 f"\n[red]✗ Failed to start PostgreSQL container:[/red] {e}\n"
-                "  [dim]Check Docker logs: docker logs " + PG_CONTAINER_NAME + "[/dim]\n"
+                "  [dim]Check Docker logs: docker logs " + container_name + "[/dim]\n"
             )
         sys.exit(1)
 
     return container
 
 
-def wait_for_postgres(client: docker.DockerClient, timeout: int = 60):
+def wait_for_postgres(client: docker.DockerClient, container_name: str = "pg-target", timeout: int = 60):
     """Wait until PostgreSQL container is healthy."""
     start = time.time()
     while time.time() - start < timeout:
         try:
-            container = client.containers.get(PG_CONTAINER_NAME)
+            container = client.containers.get(container_name)
             health = container.attrs.get("State", {}).get("Health", {}).get("Status", "")
             if health == "healthy":
                 return True
